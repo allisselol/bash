@@ -11,8 +11,10 @@ endif
 
 LDLIBS = -lreadline
 
-SRCS = main.c memory.c utils.c
-OBJS = $(SRCS:.c=.o)
+OBJDIR = obj
+
+SRCS = main.c memory.c utils.c token.c lexer.c
+OBJS = $(addprefix $(OBJDIR)/, $(SRCS:.c=.o))
 TARGET = mybash
 
 all: $(TARGET)
@@ -20,10 +22,14 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(TARGET) $(OBJS) $(LDLIBS)
 
-%.o: %.c
+# все .o собираются в папку obj/ (она создаётся автоматически, если её нет)
+$(OBJDIR)/%.o: %.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(OBJDIR):
+	mkdir -p $(OBJDIR)
+
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -rf $(OBJDIR) $(TARGET)
 
 .PHONY: all clean
