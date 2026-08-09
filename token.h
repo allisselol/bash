@@ -32,3 +32,6 @@ typedef struct{
 
 //функция добавления токена в список(массив)(вектор) токенов
 void tv_push(TokenVector* tv, Token t);
+
+//получить название типа токена строкой (для отладочной печати)
+const char* token_type_name(TokenType type);
