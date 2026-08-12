@@ -43,3 +43,9 @@ Node* new_node(NodeType type);
 
 //добавить редирект в конец списка редиректов узла
 void add_redir(Node* command, Redir r);
+
+//освободить список редиректов
+void free_redirs(Redir* redir);
+
+//полностью освободить дерево (рекурсивно)
+void free_node(Node* node);

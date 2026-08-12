@@ -13,7 +13,7 @@ LDLIBS = -lreadline
 
 OBJDIR = obj
 
-SRCS = main.c memory.c utils.c token.c lexer.c node.c parser.c
+SRCS = main.c memory.c utils.c token.c lexer.c node.c parser.c jobs.c builtins.c exec.c
 OBJS = $(addprefix $(OBJDIR)/, $(SRCS:.c=.o))
 TARGET = mybash
 
