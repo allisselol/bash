@@ -6,6 +6,10 @@
 //применить один редирект к файловым дескрипторам текущего процесса
 void do_one_redir(Redir* r);
 
+//"безопасная" версия: не завершает процесс при ошибке (используется для
+//builtin без fork - см. run_command/run_builtin_with_redirs в exec.c)
+bool do_one_redir_safe(Redir* r);
+
 //применить весь список редиректов узла
 int do_redirs(Redir* redir_list);
 

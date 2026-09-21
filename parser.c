@@ -1,10 +1,10 @@
+#include "common.h" // _POSIX_C_SOURCE 200809L должен быть определён ДО системных заголовков
 #include "parser.h"
 #include "memory.h"
 #include "utils.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <readline/readline.h>
 
 Token* see(Parser* p){
     return &p->tv->vector[p->position];
@@ -22,9 +22,17 @@ bool accept(Parser* p, TokenType token){
     return false;
 }
 
-//обязательное условие того, что токен должен быть соответствующего типа
-void expect(Parser* p, TokenType token){
-    if(!accept(p, token)) die();
+//обязательное условие того, что токен должен быть соответствующего типа.
+//Раньше при несовпадении вызывался die() - это убивало весь процесс интерпретатора,
+//что прямо запрещено ТЗ (синтаксическая ошибка не должна прерывать интерпретатор).
+//Теперь мы печатаем диагностику, поднимаем общий флаг syntax_error_flag и возвращаем
+//false - вызывающая функция обязана сразу прекратить разбор и вернуть NULL, не читая
+//больше токенов (see()/get() дальше не гарантированно безопасны после ошибки).
+bool expect(Parser* p, TokenType token){
+    if(syntax_error_flag) return false; //ошибка уже была где-то выше по стеку разбора
+    if(accept(p, token)) return true;
+    report_syntax_error("неожиданный токен");
+    return false;
 }
 
 char* heredoc(char* end_pointer){
@@ -32,8 +40,16 @@ char* heredoc(char* end_pointer){
     char* buffer = er_malloc(capacity);
     buffer[0] = '\0';
     while(true){
-        char* line = readline("> ");
-        if(!line) break;
+        printf("> "); //вторичное приглашение heredoc
+        fflush(stdout);
+
+        char* line = NULL;
+        size_t cap = 0;
+        ssize_t got = getline(&line, &cap, stdin);
+        if(got < 0){ //конец файла - обрываем heredoc как есть
+            free(line);
+            break;
+        }
         cutter(line);
         if(strcmp(line, end_pointer) == 0){
             free(line);
@@ -53,15 +69,21 @@ char* heredoc(char* end_pointer){
     return buffer;
 }
 
-//возвращаем значение (наше слово)
+//возвращаем значение (наше слово). Раньше при отсутствии слова вызывался die() -
+//теперь мягкая ошибка: диагностика + NULL, как и в expect()
 char* expect_word(Parser* p){
+    if(syntax_error_flag) return NULL;
     Token* token = get(p);
-    if(token->type != TOK_WORD) die();
+    if(token->type != TOK_WORD){
+        report_syntax_error("ожидалось слово");
+        return NULL;
+    }
     return er_strdup(token->value);
 }
 
 void add_redir_file(Parser* p, Node* node, RedirType rt, int src){
     char* target = expect_word(p);
+    if(!target) return; //ошибка уже отмечена в expect_word(); вызывающий код это проверит
     add_redir(node, (Redir){rt, src, -1, target, NULL});
 }
 
@@ -90,24 +112,28 @@ Node* parse_simple(Parser* p){
         if(token->type == TOK_REDIR_IN){
             get(p);
             add_redir_file(p, node, R_IN, 0);
+            if(syntax_error_flag) break;
             continue;
         }
 
         if(token->type == TOK_REDIR_OUT){
             get(p);
             add_redir_file(p, node, R_OUT, 1);
+            if(syntax_error_flag) break;
             continue;
         }
 
         if(token->type == TOK_REDIR_OUT_APP){
             get(p);
             add_redir_file(p, node, R_APPEND, 1);
+            if(syntax_error_flag) break;
             continue;
         }
 
         if(token->type == TOK_ALL_TO_FILE){
             get(p);
             add_redir_file(p, node, R_ALL_TO_FILE, -1);
+            if(syntax_error_flag) break;
             continue;
         }
 
@@ -116,6 +142,7 @@ Node* parse_simple(Parser* p){
             int fd = token->fd;
             get(p);
             add_redir_file(p, node, R_OUT, fd);
+            if(syntax_error_flag) break;
             continue;
         }
 
@@ -123,6 +150,7 @@ Node* parse_simple(Parser* p){
             int fd = token->fd;
             get(p);
             add_redir_file(p, node, R_IN, fd);
+            if(syntax_error_flag) break;
             continue;
         }
 
@@ -130,6 +158,7 @@ Node* parse_simple(Parser* p){
             int fd = token->fd;
             get(p);
             add_redir_file(p, node, R_APPEND, fd);
+            if(syntax_error_flag) break;
             continue;
         }
 
@@ -151,6 +180,7 @@ Node* parse_simple(Parser* p){
         if(token->type == TOK_HEREDOC){
             get(p);
             char* end_pointer = expect_word(p); //так как следующий элемент после <<EOF
+            if(syntax_error_flag) break; //end_pointer уже NULL, освобождать нечего
             char* body = heredoc(end_pointer);
             free(end_pointer);
             add_redir(node, (Redir){R_HEREDOC, 0, -1, body, NULL});
@@ -160,11 +190,17 @@ Node* parse_simple(Parser* p){
         if(token->type == TOK_HERESTR){
             get(p);
             char* str = expect_word(p);  //тут передается целая строка, так как <<< берет строку
+            if(syntax_error_flag) break;
             add_redir(node, (Redir){R_HERESTR, 0, -1, str, NULL});
             continue;
         }
 
         break;
+    }
+
+    if(syntax_error_flag){
+        free_node(node); //освобождаем всё, что уже успели собрать (argv, redirs)
+        return NULL;
     }
 
     if(seen_word == false || !node->argv){
@@ -177,9 +213,19 @@ Node* parse_simple(Parser* p){
 
 //обработка минишела ()
 Node* parse_minishell(Parser* p){
-    expect(p, TOK_LPAREN);
+    if(!expect(p, TOK_LPAREN)) return NULL;
+
     Node* massive = parse_line(p);
-    expect(p, TOK_RPAREN);
+    if(syntax_error_flag){
+        free_node(massive);
+        return NULL;
+    }
+
+    if(!expect(p, TOK_RPAREN)){
+        free_node(massive);
+        return NULL;
+    }
+
     Node* node = new_node(NODE_MINISHELL);
     node->left = massive;
 
@@ -188,25 +234,33 @@ Node* parse_minishell(Parser* p){
 
         if(token->type == TOK_REDIR_IN){
             get(p);
-            add_redir(node, (Redir){R_IN, 0, -1, expect_word(p), NULL});
+            char* target = expect_word(p);
+            if(syntax_error_flag){ free_node(node); return NULL; }
+            add_redir(node, (Redir){R_IN, 0, -1, target, NULL});
             continue;
         }
 
         if(token->type == TOK_REDIR_OUT){
             get(p);
-            add_redir(node, (Redir){R_OUT, 1, -1, expect_word(p), NULL});
+            char* target = expect_word(p);
+            if(syntax_error_flag){ free_node(node); return NULL; }
+            add_redir(node, (Redir){R_OUT, 1, -1, target, NULL});
             continue;
         }
 
         if(token->type == TOK_REDIR_OUT_APP){
             get(p);
-            add_redir(node, (Redir){R_APPEND, 1, -1, expect_word(p), NULL});
+            char* target = expect_word(p);
+            if(syntax_error_flag){ free_node(node); return NULL; }
+            add_redir(node, (Redir){R_APPEND, 1, -1, target, NULL});
             continue;
         }
 
         if(token->type == TOK_ALL_TO_FILE){
             get(p);
-            add_redir(node, (Redir){R_ALL_TO_FILE, -1, -1, expect_word(p), NULL});
+            char* target = expect_word(p);
+            if(syntax_error_flag){ free_node(node); return NULL; }
+            add_redir(node, (Redir){R_ALL_TO_FILE, -1, -1, target, NULL});
             continue;
         }
 
@@ -229,10 +283,14 @@ Node* parse_command(Parser* p){
 // |
 Node* parse_pipeline(Parser* p){
     Node* left = parse_command(p);
-    if(!left) return NULL;
+    if(!left) return NULL; //либо действительно пусто, либо уже была ошибка - разберутся выше
     while((accept(p, TOK_PIPE))){
         Node* right = parse_command(p);
-        if(!right) die();
+        if(!right){
+            if(!syntax_error_flag) report_syntax_error("ожидалась команда после '|'");
+            free_node(left);
+            return NULL;
+        }
         Node* pipe = new_node(NODE_PIPE);
         pipe->left = left;
         pipe->right = right;
@@ -248,12 +306,20 @@ Node* parse_and_or(Parser* p){
     while(true){
         if(accept(p, TOK_AND)){
             Node* right = parse_pipeline(p);
-            if(!right) die();
+            if(!right){
+                if(!syntax_error_flag) report_syntax_error("ожидалась команда после '&&'");
+                free_node(left);
+                return NULL;
+            }
             Node* a = new_node(NODE_AND);
             a->left = left; a->right = right; left = a;
         } else if(accept(p, TOK_OR)){
             Node* right = parse_pipeline(p);
-            if(!right) die();
+            if(!right){
+                if(!syntax_error_flag) report_syntax_error("ожидалась команда после '||'");
+                free_node(left);
+                return NULL;
+            }
             Node* b = new_node(NODE_OR);
             b->left = left; b->right = right; left = b;
         } else break;
@@ -268,7 +334,13 @@ Node* parse_line(Parser* p){
 
     while(1){
         Node* term = parse_and_or(p);
-        if(!term) break;
+        if(!term){
+            if(syntax_error_flag){
+                free_node(result);
+                return NULL;
+            }
+            break; //настоящий конец ввода - команд больше нет, это не ошибка
+        }
 
         bool had_bg = false;
         if(accept(p, TOK_BG)){

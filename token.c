@@ -1,5 +1,7 @@
+#include "common.h" // _POSIX_C_SOURCE 200809L должен быть определён ДО системных заголовков
 #include "token.h"
 #include "memory.h"
+#include <stdio.h>
 
 //функция добавления токена в список(массив)(вектор) токенов
 void tv_push(TokenVector* tv, Token t){
@@ -40,3 +42,13 @@ const char* token_type_name(TokenType type){
     }
     return "UNKNOWN";
 }
+
+bool syntax_error_flag = false;
+
+//напечатать диагностическое сообщение об ошибке синтаксиса и поднять syntax_error_flag
+void report_syntax_error(const char* msg){
+    fprintf(stderr, "mysh: синтаксическая ошибка: %s\n", msg);
+    syntax_error_flag = true;
+}
+
+int last_exit_status = 0;

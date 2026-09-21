@@ -1,3 +1,4 @@
+#include "common.h" // _POSIX_C_SOURCE 200809L должен быть определён ДО системных заголовков
 #include "jobs.h"
 #include "memory.h"
 #include <stdio.h>
@@ -8,6 +9,16 @@
 #include <sys/wait.h>
 
 JobVec jobs = {NULL, 0, 0, 1};
+int current_job_id = -1;
+int previous_job_id = -1;
+
+//задание становится "текущим" (последнее добавленное или остановленное);
+//прежнее текущее сдвигается в "предыдущее"
+static void mark_current(int id){
+    if(current_job_id == id) return; //уже текущее - ничего не сдвигаем
+    previous_job_id = current_job_id;
+    current_job_id = id;
+}
 
 //добавление задание
 Job* jobs_add(pid_t pgid, char* cmdline){
@@ -25,7 +36,9 @@ Job* jobs_add(pid_t pgid, char* cmdline){
         .cmdline = er_strdup(cmdline), //возвращаем указатель на новую строку
         .status = J_RUNNING
     };
-    return &jobs.vector[jobs.count++]; //возвращаем указатель на этот элемент
+    Job* job = &jobs.vector[jobs.count++];
+    mark_current(job->id); //новое фоновое задание становится текущим
+    return job;
 }
 
 Job* jobs_by_id(int id){
@@ -50,6 +63,10 @@ void jobs_remove(void){
     int tmp = 0; //создаем какой-нибудь указатель для сдвига удаленных блоков
     for(int i = 0; i < jobs.count; i++){
         if(jobs.vector[i].status == J_DONE){
+            //если удаляем текущее/предыдущее задание - сбрасываем маркеры,
+            //чтобы %+ / %- не указывали на несуществующее задание
+            if(jobs.vector[i].id == current_job_id)  current_job_id = -1;
+            if(jobs.vector[i].id == previous_job_id) previous_job_id = -1;
             free(jobs.vector[i].cmdline);
             continue;
         }
@@ -62,22 +79,43 @@ void jobs_remove(void){
 
     if(jobs.count == 0){
         jobs.next_id = 1;
+        current_job_id = -1;
+        previous_job_id = -1;
     }
+}
+
+Job* resolve_job_spec(const char* spec){
+    if(!spec || !*spec) return NULL;
+
+    if(spec[0] == '%'){
+        const char* rest = spec + 1;
+        if(strcmp(rest, "+") == 0) return jobs_by_id(current_job_id);
+        if(strcmp(rest, "-") == 0) return jobs_by_id(previous_job_id);
+        char* end;
+        long id = strtol(rest, &end, 10);
+        if(*rest == '\0' || *end != '\0') return NULL;
+        return jobs_by_id((int)id);
+    }
+
+    //голое число тоже трактуем как номер задания (уже было такое поведение в fg/bg)
+    char* end;
+    long id = strtol(spec, &end, 10);
+    if(*spec == '\0' || *end != '\0') return NULL;
+    return jobs_by_id((int)id);
 }
 
 void jobs_print(void){
     for(int i = 0; i < jobs.count; i++){
-        char* status;
-        if(jobs.vector[i].status == J_RUNNING){
-            status = "Running";
-        }
-        else if(jobs.vector[i].status == J_DONE){
-            continue;
-        }
-        else {
-            status = "stoppped";
-        }
-        printf("[%d], %8s, %s \n",  jobs.vector[i].id, status, jobs.vector[i].cmdline);
+        Job* j = &jobs.vector[i];
+        if(j->status == J_DONE) continue;
+
+        char* status = (j->status == J_RUNNING) ? "Running" : "Stopped";
+        char marker = ' ';
+        if(j->id == current_job_id)       marker = '+';
+        else if(j->id == previous_job_id) marker = '-';
+
+        //формат по ТЗ: "[1]+  Running                 sleep 10 &"
+        printf("[%d]%c  %-20s %s\n", j->id, marker, status, j->cmdline);
     }
 }
 
@@ -99,7 +137,10 @@ void get_children(void){
         }
         Job* job = jobs_by_pgid(pgroup);
         if(!job) continue;
-        if(WIFSTOPPED(status)) job->status = J_STOPPED;
+        if(WIFSTOPPED(status)){
+            job->status = J_STOPPED;
+            mark_current(job->id); //только что остановленное задание становится текущим
+        }
         else if(WIFCONTINUED(status)) job->status = J_RUNNING;
         else if(WIFEXITED(status) || WIFSIGNALED(status)) job->status = J_DONE;  //завершился нормально или сигналом
     }
@@ -109,6 +150,7 @@ void get_children(void){
 struct termios shell_settings;
 pid_t shell_pgid;
 int shell_terminal = -1; //пока не проинициализирован
+bool shell_interactive = false; //main.c выставит в true, если stdin - терминал
 
 int put_job_fg(Job* job, int continuee){    //continue - останавливался ли процесс
     int status = 0;

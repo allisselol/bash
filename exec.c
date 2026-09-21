@@ -1,6 +1,8 @@
+#include "common.h" // _POSIX_C_SOURCE 200809L должен быть определён ДО системных заголовков
 #include "exec.h"
 #include "builtins.h"
 #include "jobs.h"
+#include "memory.h" // er_malloc (используется в run_builtin_with_redirs)
 #include "common.h" // BG_BLOCK_MS
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,154 +14,151 @@
 #include <time.h>
 #include <sys/wait.h>
 
-void do_one_redir(Redir* r){
-    int fd; //tmp дескриптор
+//Классификация ошибки после неудачного execvp, по ТЗ:
+//- команда не найдена (ENOENT/ENOTDIR - не найден сам файл или компонент пути) -> 127
+//- команда найдена, но не может быть выполнена (нет прав, это каталог,
+//  неверный формат исполняемого файла и т.п.) -> 126
+//Раньше здесь всегда безусловно возвращался 127, что не различало эти два случая.
+static int exec_fail_status(const char* name){
+    int code = (errno == ENOENT || errno == ENOTDIR) ? 127 : 126;
+    fprintf(stderr, "mysh: %s: %s\n", name, strerror(errno));
+    return code;
+}
+
+//Общее ядро применения одного редиректа. Раньше это было прямо в do_one_redir
+//и при любой ошибке безусловно звало _exit(1) - это годится для форкнутого
+//потомка (внешняя команда), но НЕ годится для builtin, который по ТЗ должен
+//выполняться в самом процессе интерпретатора: там ошибка открытия файла должна
+//не убивать весь шелл, а просто отменить выполнение команды с кодом 1.
+//fatal=true  - поведение как раньше (для внешних команд в дочернем процессе)
+//fatal=false - печатает диагностику и возвращает false вместо _exit()
+static bool apply_redir(Redir* r, bool fatal){
+    int fd;
 
     // <
     if(r->type == R_IN){
         fd = open(r->target, O_RDONLY);
         if(fd < 0){
-            perror(r->target);
-            _exit(1);  //немедленно завершает текущий процесс, без очистки буфера и прочего
+            if(fatal){ perror(r->target); _exit(1); }
+            fprintf(stderr, "mysh: %s: %s\n", r->target, strerror(errno));
+            return false;
         }
-        if(r->src <= 0){
-            if(dup2(fd, 0) < 0){
-                perror("dup2");
-                _exit(1);
-            }
-        } else {
-            if(dup2(fd, r->src) < 0){
-                perror("dup2");
-                _exit(1); //0 успешное завершение, 1 - неудача // exit() сохраняет программу с сохранением буферов, а _exit() все сносит
-            }
+        int dest = (r->src <= 0) ? 0 : r->src;
+        if(dup2(fd, dest) < 0){
+            close(fd);
+            if(fatal){ perror("dup2"); _exit(1); }
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
+            return false;
         }
         close(fd);
     }
 
-    // >
-    else if(r->type == R_OUT){
-        fd = open(r->target, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
+    // > и >> (права 0666 с учётом umask процесса, как требует ТЗ - раньше
+    // было жёстко захардкожено 0644, что игнорировало umask)
+    else if(r->type == R_OUT || r->type == R_APPEND){
+        int flags = O_WRONLY | O_CREAT | (r->type == R_APPEND ? O_APPEND : O_TRUNC);
+        fd = open(r->target, flags, 0666);
         if(fd < 0){
-            perror(r->target);
-            _exit(1);
+            if(fatal){ perror(r->target); _exit(1); }
+            fprintf(stderr, "mysh: %s: %s\n", r->target, strerror(errno));
+            return false;
         }
-        if(r->src <= 1){
-            if(dup2(fd, 1) < 0){
-                perror("dup2");
-                _exit(1);
-            }
-        } else {
-            if(dup2(fd, r->src) < 0){
-                perror("dup2");
-                _exit(1);
-            }
-        }
-        close(fd);
-    }
-
-    // >>
-    else if(r->type == R_APPEND){
-        fd = open(r->target, O_WRONLY | O_CREAT | O_APPEND, 0644);
-
-        if(fd < 0){
-            perror(r->target);
-            _exit(1);
-        }
-        if(r->src <= 1){
-            if(dup2(fd, 1) < 0){
-                perror("dup2");
-                _exit(1);
-            }
-        } else {
-            if(dup2(fd, r->src) < 0){
-                perror("dup2");
-                _exit(1);
-            }
+        int dest = (r->src <= 1) ? 1 : r->src;
+        if(dup2(fd, dest) < 0){
+            close(fd);
+            if(fatal){ perror("dup2"); _exit(1); }
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
+            return false;
         }
         close(fd);
     }
 
     // &>
     else if(r->type == R_ALL_TO_FILE){
-        int fd2 = open(r->target, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-        if(fd2 < 0){
-            perror(r->target);
-            _exit(1);
+        fd = open(r->target, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if(fd < 0){
+            if(fatal){ perror(r->target); _exit(1); }
+            fprintf(stderr, "mysh: %s: %s\n", r->target, strerror(errno));
+            return false;
         }
-
-        if(dup2(fd2, STDOUT_FILENO) < 0){
-            perror("dup2");
-            _exit(1);
+        if(dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0){
+            close(fd);
+            if(fatal){ perror("dup2"); _exit(1); }
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
+            return false;
         }
-
-        if(dup2(fd2, STDERR_FILENO) < 0){
-            perror("dup2");
-            _exit(1);
-        }
-
-        close(fd2);
+        close(fd);
     }
 
     //дублирование вывода 2>&1 перенаправь std_err туда же куда и std_out
     else if(r->type == R_DUP_OUT){
-        int dest_fd;
-        if(r->src <= 1) dest_fd = 1;
-        else dest_fd = r->src;
-
-        if(dup2(r->dup_target, dest_fd) < 0){
-            perror("dup2");
-            _exit(1);
+        int dest = (r->src <= 1) ? 1 : r->src;
+        if(dup2(r->dup_target, dest) < 0){
+            if(fatal){ perror("dup2"); _exit(1); }
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
+            return false;
         }
     }
 
     //Дублирование ввода <&N
     else if(r->type == R_DUP_IN){
-        int dest_fd;
-        if(r->src <= 0) dest_fd = 0;
-        else dest_fd = r->src;
-
-        if(dup2(r->dup_target, dest_fd) < 0){
-            perror("dup2");
-            _exit(1);
+        int dest = (r->src <= 0) ? 0 : r->src;
+        if(dup2(r->dup_target, dest) < 0){
+            if(fatal){ perror("dup2"); _exit(1); }
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
+            return false;
         }
     }
 
     // <<EOF || // <<< "string smth"
     else if(r->type == R_HEREDOC || r->type == R_HERESTR){
-
         if(r->src > 0){
-            fprintf(stderr, "Ввод только в stdin\n");
-            _exit(1);
+            if(fatal){ fprintf(stderr, "Ввод только в stdin\n"); _exit(1); }
+            fprintf(stderr, "mysh: ввод только в stdin\n");
+            return false;
         }
 
         int p[2];
         if(pipe(p) < 0){
-            perror("pipe");
-            _exit(1); //_exit(1) - чтобы родительские буферы случайно не трогать
+            if(fatal){ perror("pipe"); _exit(1); }
+            fprintf(stderr, "mysh: pipe: %s\n", strerror(errno));
+            return false;
         }
 
         size_t len = strlen(r->target);
-
-        if(len > 0){
-            write(p[1], r->target, len);
-        }
+        if(len > 0) write(p[1], r->target, len);
         close(p[1]);
 
-        //в какой файловый дескриптор нужно подменить ввод
-
         if(dup2(p[0], STDIN_FILENO) < 0){
-            perror("dup2");
-            _exit(1);
+            close(p[0]);
+            if(fatal){ perror("dup2"); _exit(1); }
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
+            return false;
         }
-
         close(p[0]);
     }
 
     else {
-        fprintf(stderr, "Неизвестный тип перенаправления\n");
+        if(fatal){
+            fprintf(stderr, "Неизвестный тип перенаправления\n");
+        } else {
+            fprintf(stderr, "mysh: неизвестный тип перенаправления\n");
+            return false;
+        }
     }
+
+    return true;
+}
+
+void do_one_redir(Redir* r){
+    apply_redir(r, true);
+}
+
+//"безопасная" версия для builtin без fork (см. run_builtin_with_redirs):
+//не завершает процесс интерпретатора при ошибке, а по ТЗ возвращает
+//диагностику и false, чтобы вызывающий код мог отменить команду с кодом 1
+bool do_one_redir_safe(Redir* r){
+    return apply_redir(r, false);
 }
 
 int do_redirs(Redir* redir_list){
@@ -169,13 +168,95 @@ int do_redirs(Redir* redir_list){
     return 0;
 }
 
+//вычисляет, какой именно файловый дескриптор процесса подменит данный
+//редирект (та же логика выбора dest, что и внутри apply_redir)
+static int redir_target_fd(Redir* r){
+    switch(r->type){
+        case R_IN:          return (r->src <= 0) ? 0 : r->src;
+        case R_OUT:
+        case R_APPEND:      return (r->src <= 1) ? 1 : r->src;
+        case R_DUP_OUT:     return (r->src <= 1) ? 1 : r->src;
+        case R_DUP_IN:      return (r->src <= 0) ? 0 : r->src;
+        case R_HEREDOC:
+        case R_HERESTR:     return 0;
+        case R_ALL_TO_FILE: return -1; //особый случай - трогает сразу 1 и 2, обрабатывается отдельно
+    }
+    return -1;
+}
+
+//Выполнить builtin С редиректами БЕЗ fork - именно так требует ТЗ: "для
+//встроенной команды, выполняемой без конвейера, перенаправления применяются
+//в самом процессе интерпретатора: исходные дескрипторы сохраняются вызовом
+//dup, а после выполнения восстанавливаются". Раньше в этом случае код форкал
+//дочерний процесс - из-за этого, например, `cd /tmp > log.txt` реально менял
+//каталog только у уже завершившегося потомка, а сам шелл оставался на месте.
+static int run_builtin_with_redirs(Node* node){
+    int count = 0;
+    for(Redir* r = node->redirs; r; r = r->next){
+        count += (r->type == R_ALL_TO_FILE) ? 2 : 1;
+    }
+
+    int* saved_fd = er_malloc((size_t)count * sizeof(int));
+    int* orig_fd  = er_malloc((size_t)count * sizeof(int));
+    int nsaved = 0;
+
+    //сохраняем исходные дескрипторы через dup ДО применения редиректов
+    for(Redir* r = node->redirs; r; r = r->next){
+        if(r->type == R_ALL_TO_FILE){
+            int fds[2] = {STDOUT_FILENO, STDERR_FILENO};
+            for(int i = 0; i < 2; i++){
+                orig_fd[nsaved]  = fds[i];
+                saved_fd[nsaved] = dup(fds[i]);
+                nsaved++;
+            }
+        } else {
+            int fd = redir_target_fd(r);
+            orig_fd[nsaved]  = fd;
+            saved_fd[nsaved] = dup(fd);
+            nsaved++;
+        }
+    }
+
+    //применяем сами редиректы; при первой же ошибке открытия файла -
+    //по ТЗ команда отменяется целиком, код возврата 1
+    bool ok = true;
+    for(Redir* r = node->redirs; r; r = r->next){
+        if(!do_one_redir_safe(r)){
+            ok = false;
+            break;
+        }
+    }
+
+    int status = ok ? run_mybuilt(node) : 1;
+
+    fflush(NULL); //критично: сбрасываем буферы ДО восстановления исходных
+                  //дескрипторов - иначе буферизованный вывод builtin'а рискует
+                  //попасть не в перенаправленный файл, а в терминал (при следующем
+                  //флаше уже после dup2 назад) или вовсе потеряться
+
+    //восстанавливаем исходные дескрипторы в обратном порядке
+    for(int i = nsaved - 1; i >= 0; i--){
+        dup2(saved_fd[i], orig_fd[i]);
+        close(saved_fd[i]);
+    }
+    free(saved_fd);
+    free(orig_fd);
+
+    return status;
+}
+
 int run_command(Node* node){
     if(node->argv == NULL || node->argv[0] == NULL){
         return 0; //если в узле банально аргументов нет, но как бы вышли без ошибок
     }
 
-    if(is_mybuilt(node) && node->redirs == NULL){
-        return run_mybuilt(node);
+    if(is_mybuilt(node)){
+        //builtin без конвейера всегда выполняется в самом процессе интерпретатора -
+        //с редиректами (через dup, см. run_builtin_with_redirs) или без них
+        if(node->redirs == NULL){
+            return run_mybuilt(node);
+        }
+        return run_builtin_with_redirs(node);
     }
 
     fflush(NULL); // сбрасываем буферы ДО fork(), иначе child унаследует непропечатанный
@@ -196,17 +277,8 @@ int run_command(Node* node){
 
         if(node->redirs) do_redirs(node->redirs);
 
-        if(is_mybuilt(node)){
-            int built_in_command = run_mybuilt(node);
-            fflush(NULL); // критично: _exit() не сбрасывает буферы stdio, а stdout сейчас
-                           // может указывать на файл (после do_redirs), а не на терминал
-            _exit(built_in_command);
-        }
-
         execvp(node->argv[0], node->argv);
-
-        perror("execvp");
-        _exit(127); //команда не найдена
+        _exit(exec_fail_status(node->argv[0]));
     } else {
 
         setpgid(pid, pid);
@@ -417,8 +489,7 @@ int run_node(Node* node, char* cmdline){
                 }
 
                 execvp(cmd->argv[0], cmd->argv);
-                perror("execvp");
-                _exit(127);
+                _exit(exec_fail_status(cmd->argv[0]));
             }
             else {
                 setpgid(pid, pid);

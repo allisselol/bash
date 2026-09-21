@@ -1,15 +1,10 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=gnu11
 
-# На macOS (M3, Homebrew в /opt/homebrew) нужно явно указать пути к readline,
-# т.к. системный readline.h в Xcode SDK - урезанная замена без части функций.
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
-    CFLAGS += -I/opt/homebrew/opt/readline/include
-    LDFLAGS += -L/opt/homebrew/opt/readline/lib
-endif
-
-LDLIBS = -lreadline
+# Некоторые более старые версии gcc/clang ещё не знают официальное имя "c23"
+# (стандарт утверждён в 2024) и требуют временное имя "c2x" - определяем
+# автоматически, что поддерживает конкретный компилятор.
+STD := $(shell echo "" | $(CC) -std=c23 -xc -E - >/dev/null 2>&1 && echo c23 || echo c2x)
+CFLAGS = -Wall -Wextra -std=$(STD)
 
 OBJDIR = obj
 
@@ -29,7 +24,12 @@ $(OBJDIR)/%.o: %.c | $(OBJDIR)
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
+# сборка с диагностическими средствами (требование ТЗ): AddressSanitizer + UBSan + отладочная информация
+debug: CFLAGS += -fsanitize=address,undefined -g -O0
+debug: LDFLAGS += -fsanitize=address,undefined
+debug: clean $(TARGET)
+
 clean:
 	rm -rf $(OBJDIR) $(TARGET)
 
-.PHONY: all clean
+.PHONY: all debug clean

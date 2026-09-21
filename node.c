@@ -1,3 +1,4 @@
+#include "common.h" // _POSIX_C_SOURCE 200809L должен быть определён ДО системных заголовков
 #include "node.h"
 #include "memory.h"
 #include <stddef.h>

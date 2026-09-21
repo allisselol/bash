@@ -1,11 +1,14 @@
+#include "common.h" // _POSIX_C_SOURCE 200809L должен быть определён ДО системных заголовков
 #include "lexer.h"
 #include "memory.h"
 #include "utils.h"
 #include <ctype.h>
 #include <string.h>
-#include <stdio.h>  // EOF, fprintf, popen/pclose, fgetc
+#include <stdio.h>  // EOF, fprintf
 #include <stdlib.h> // free
 #include <pwd.h>    // getpwnam
+#include <unistd.h> // fork, pipe, dup2, execvp, read, close
+#include <sys/wait.h> // waitpid
 
 //является ли текущий символ концом строки
 bool cur_eof(Cursor* c){
@@ -65,28 +68,86 @@ int read_number(Cursor* c){
     return value;
 }
 
-//Функция для чтения $()/`....` - команду внутри
+//Функция для чтения $()/`....` - команду внутри.
+//ВАЖНО: раньше здесь был popen("sh -c ..."), что запрещено по ТЗ (запуск через внешний shell).
+//Теперь делаем то же самое, что и в run_pipeline: pipe() + fork() + execvp() напрямую,
+//без обращения к /bin/sh. Ограничение: внутри $(...) поддерживается одна простая команда
+//со словами/кавычками, но не полноценный конвейер/редиректы (это сознательное упрощение
+//для необязательной "сверх базовой" фичи, не требуемой по ТЗ).
 char* read_command(char* command){
-    char* cmd = NULL; //буфер для будущей команды в shell
-    if(asprintf(&cmd, "sh -c '%s'", command) < 0) die();
-    FILE* fp = popen(cmd, "r");
-    free(cmd);
-    if(!fp) return er_strdup("");
+    //разбиваем command на argv, используя свои же примитивы лексера (без popen/sh)
+    Cursor cc = { command, 0, strlen(command) };
+    size_t argc = 0, cap = 8;
+    char** argv = er_malloc(cap * sizeof(char*));
+
+    while(1){
+        skip_spaces(&cc);
+        if(cur_eof(&cc)) break;
+        char* w = read_words(&cc);
+        if(!w) break;
+        if(argc + 1 >= cap){
+            cap *= 2;
+            argv = er_realloc(argv, cap * sizeof(char*));
+        }
+        argv[argc++] = w;
+    }
+    argv[argc] = NULL;
+
+    if(argc == 0){
+        free(argv);
+        return er_strdup("");
+    }
+
+    int p[2];
+    if(pipe(p) < 0){
+        for(size_t i = 0; i < argc; i++) free(argv[i]);
+        free(argv);
+        return er_strdup("");
+    }
+
+    pid_t pid = fork();
+    if(pid < 0){
+        close(p[0]); close(p[1]);
+        for(size_t i = 0; i < argc; i++) free(argv[i]);
+        free(argv);
+        return er_strdup("");
+    }
+
+    if(pid == 0){
+        //потомок: перенаправляем свой stdout в записывающий конец пайпа и выполняем команду
+        close(p[0]);
+        if(dup2(p[1], STDOUT_FILENO) < 0) _exit(127);
+        close(p[1]);
+        execvp(argv[0], argv);
+        //если execvp вернулся - команда не найдена/не выполнена
+        _exit(127);
+    }
+
+    //родитель: читаем вывод из читающего конца пайпа
+    close(p[1]);
+    for(size_t i = 0; i < argc; i++) free(argv[i]);
+    free(argv);
 
     size_t capacity = 256, count = 0;
     char* out = er_malloc(capacity);
-    int symbol;
-    while((symbol = fgetc(fp)) != EOF){
-        if(count + 1 >= capacity){
+    char buf[256];
+    ssize_t r;
+    while((r = read(p[0], buf, sizeof(buf))) > 0){
+        while(count + (size_t)r + 1 >= capacity){
             capacity *= 2;
-            out = er_realloc(out, capacity);
         }
-        out[count++] = (char)symbol;
+        out = er_realloc(out, capacity);
+        memcpy(out + count, buf, (size_t)r);
+        count += (size_t)r;
     }
     out[count] = '\0';
-    pclose(fp);
+    close(p[0]);
+
+    int status;
+    waitpid(pid, &status, 0); //дожидаемся завершения, чтобы не оставить зомби
+
     cutter(out); //как правило команды всегда заканчивают вывод переводом на следующую строку
-    return(out);
+    return out;
 }
 
 //функция для получения домашнего каталога(директории), полного пути к ней
@@ -247,6 +308,26 @@ char* read_words(Cursor* c){
             else if (!cur_eof(c) && cur_see(c) == '}') {
                 fprintf(stderr, "Неверный синтаксис\n");
                 cur_get(c);  // считываем '}', чтобы не застрять
+                start = false;
+                continue;
+            }
+
+            //$? - код возврата последней команды. Раньше этот случай не был
+            //отдельно обработан: '?' не подходит под isalnum/'_' из generic-ветки
+            //ниже, поэтому цикл там ничего не забирал, а сам символ '?' просто
+            //оставался в потоке и печатался буквально как есть.
+            else if(!cur_eof(c) && cur_see(c) == '?'){
+                cur_get(c); //съедаем сам '?'
+                char status_buf[16];
+                snprintf(status_buf, sizeof(status_buf), "%d", last_exit_status);
+                size_t len = strlen(status_buf);
+                while(count + len + 1 >= capacity){
+                    capacity *= 2;
+                    buffer = er_realloc(buffer, capacity);
+                }
+                memcpy(buffer + count, status_buf, len);
+                count += len;
+                buffer[count] = '\0';
                 start = false;
                 continue;
             }
@@ -494,7 +575,16 @@ void lexer(char* line, TokenVector* tv){
             continue;
         }
 
-        if(!cur_eof(&cur)) cur.position++;
+        if(!cur_eof(&cur)){
+            //раньше здесь было молчаливое cur.position++ - строка с "мусорным"
+            //символом просто теряла его без единого сообщения. По ТЗ неподдерживаемая
+            //конструкция обязана быть диагностированной ошибкой, а не тихо съедаться
+            char bad = (char)cur_see(&cur);
+            char msg[64];
+            snprintf(msg, sizeof(msg), "недопустимый символ '%c'", bad);
+            report_syntax_error(msg);
+            break; //строка целиком отвергается как ошибочная - дальше не токенизируем
+        }
     }
 
     tv_push(tv, (Token){TOK_END, NULL, -1});

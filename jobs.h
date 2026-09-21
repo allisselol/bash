@@ -29,12 +29,23 @@ typedef struct {
 
 extern JobVec jobs;
 
+//"текущее" (последнее переведённое в фон или остановленное) и "предыдущее"
+//задание - id заданий, используются для маркеров +/- в выводе jobs и для
+//спецификаторов %+ / %- в fg/bg/kill/wait
+extern int current_job_id;
+extern int previous_job_id;
+
 //добавление задания
 Job* jobs_add(pid_t pgid, char* cmdline);
 Job* jobs_by_id(int id);
 Job* jobs_by_pgid(pid_t pgid);
 void jobs_remove(void);
 void jobs_print(void);
+
+//разобрать спецификатор задания: "%n" (номер), "%+"/"%-" (текущее/предыдущее),
+//либо просто число (тоже трактуется как номер задания). Возвращает NULL,
+//если такого задания нет.
+Job* resolve_job_spec(const char* spec);
 
 //SIGCHLD
 extern volatile sig_atomic_t signchild; //не получили сигнала ребенка
@@ -46,6 +57,11 @@ void get_children(void);
 extern struct termios shell_settings;
 extern pid_t shell_pgid;
 extern int shell_terminal;
+
+//интерактивен ли текущий запуск (stdin - терминал). Выставляется в main.c;
+//используется fg/bg, чтобы по ТЗ завершаться с ошибкой в неинтерактивном режиме
+//(в нём управление заданиями отключено).
+extern bool shell_interactive;
 
 int  put_job_fg(Job* job, int continuee);
 void put_job_bg(Job* job, int continuee);

@@ -1,7 +1,6 @@
 #pragma once
 
-#define POSIX_C_SOURCE 199309L
-#define _GNU_SOURCE //Дополнительные функции
+#define _POSIX_C_SOURCE 200809L //POSIX.1-2008: даёт getline, strdup, kill и т.д.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,8 +13,6 @@
 #include <termios.h>
 #include <signal.h>
 #include <sys/wait.h>
-#include <readline/readline.h> //ввод строки, стрелочки по командам
-#include <readline/history.h>  //хранит список введеных ранее команд
 #include <fcntl.h>
 #include <time.h>
 

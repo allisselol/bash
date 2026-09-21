@@ -9,6 +9,10 @@ int my_echo(char** argv);
 int my_jobs(void);
 int my_fg(char** argv);
 int my_bg(char** argv);
+int my_exit(char** argv);
+int my_help(void);
+int my_kill(char** argv);
+int my_wait(char** argv);
 
 //является ли узел встроенной командой
 int is_mybuilt(Node* node);
