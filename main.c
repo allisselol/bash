@@ -248,8 +248,6 @@ static int dump_ast_mode(void){
     free(line);
     return status;
 }
-//-----------------------------------------------------------------------------
-
 //теперь задача за малым, нужно лишь собрать все воедино
 int main(int argc, char** argv){
     //--dump-tokens / --dump-ast обрабатываются ДО инициализации терминала и
@@ -287,19 +285,16 @@ int main(int argc, char** argv){
     sigemptyset(&sa.sa_mask); //очищаем набор блокируемых сигналов внутри этой структуры
     sa.sa_flags = SA_RESTART; //прерванные системные вызовы автоматически перезапускаются
     sigaction(SIGCHLD, &sa, NULL);
-
     signal(SIGINT,  SIG_IGN);
     signal(SIGTSTP, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
     signal(SIGTTIN, SIG_IGN);
     signal(SIGTTOU, SIG_IGN);
-
     char* exe_path = read_exe_path();
     if(exe_path){
         setenv("SHELL", exe_path, 1); //если существует в окружении, перезаписать её новым значением
         free(exe_path);
     }
-
     bool interactive = isatty(STDIN_FILENO);
     shell_interactive = interactive; //делаем видимым и для builtin'ов (fg/bg) из jobs.h
     //last_exit_status - глобальная переменная из token.h/.c: код возврата последней
@@ -312,19 +307,14 @@ int main(int argc, char** argv){
     if(dash_c_command){
         shell_interactive = false;
         last_exit_status = process_line(dash_c_command, true);
-
         for(int i = 0; i < jobs.count; i++) free(jobs.vector[i].cmdline);
         free(jobs.vector);
         return last_exit_status;
     }
-
-    //основной цикл
-    while(true){
+    while(true){//основной цикл
         get_children();
         jobs_remove();
-
         maybe_soft_block_prompt();
-
         char* string = welcome_string();
         if(interactive){
             newline_if_needed();
@@ -332,11 +322,9 @@ int main(int argc, char** argv){
             fflush(stdout); //приглашение должно появиться до того, как getline заблокируется на вводе
         }
         free(string);
-
         char* line = NULL;
         size_t cap = 0;
         ssize_t got = getline(&line, &cap, stdin);
-
         if(got < 0){ //конец файла (Ctrl+D) или ошибка чтения
             free(line);
             if(interactive) putchar('\n');
@@ -347,23 +335,18 @@ int main(int argc, char** argv){
             free(line);
             continue;
         }
-
         last_exit_status = process_line(line, true);
-
         if(last_exit_status == 2 && syntax_error_flag && !interactive){
             //неинтерактивный режим: синтаксическая ошибка прерывает выполнение
             //(диагностика уже напечатана внутри process_line -> лексер/парсер)
             free(line);
             break;
         }
-
         free(line);
     }
-
     for(int i = 0; i < jobs.count; i++){
         free(jobs.vector[i].cmdline);
     }
-
     free(jobs.vector);
     return last_exit_status;
 }

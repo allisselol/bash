@@ -273,25 +273,20 @@ static const struct { const char* name; int sig; } signal_table[] = {
 static int parse_signal_name(const char* s){
     if(!s || !*s) return -1;
     if(s[0] == 'S' && s[1] == 'I' && s[2] == 'G') s += 3; //допускаем и "SIGTERM", и просто "TERM"
-
     for(size_t i = 0; i < sizeof(signal_table)/sizeof(signal_table[0]); i++){
         if(strcmp(signal_table[i].name, s) == 0) return signal_table[i].sig;
     }
-
     char* end;
     long n = strtol(s, &end, 10);
     if(*s != '\0' && *end == '\0') return (int)n; //это было просто число
-
     return -1;
 }
-
 //kill [-s СИГНАЛ | -СИГНАЛ] цель ...
 //Сигнал по умолчанию - SIGTERM. Цель - pid (число) либо спецификатор задания (%n/%+/%-),
 //в этом случае сигнал уходит всей группе процессов задания.
 int my_kill(char** argv){
     int sig = SIGTERM;
     int i = 1;
-
     if(argv[i] && strcmp(argv[i], "-s") == 0){
         if(!argv[i+1]){
             fprintf(stderr, "mysh: kill: опция -s требует аргумент\n");
@@ -313,12 +308,10 @@ int my_kill(char** argv){
         sig = parsed;
         i += 1;
     }
-
     if(!argv[i]){
         fprintf(stderr, "mysh: kill: не указана цель\n");
         return 1;
     }
-
     int status = 0;
     for(; argv[i]; i++){
         if(argv[i][0] == '%'){
@@ -332,8 +325,7 @@ int my_kill(char** argv){
                 fprintf(stderr, "mysh: kill: %s: %s\n", argv[i], strerror(errno));
                 status = 1;
             }
-        } else {
-            char* end;
+        } else {char* end;
             long pid = strtol(argv[i], &end, 10);
             if(*argv[i] == '\0' || *end != '\0'){
                 fprintf(stderr, "mysh: kill: %s: неверный аргумент\n", argv[i]);
@@ -360,7 +352,6 @@ int my_wait(char** argv){
                 if(jobs.vector[i].status == J_RUNNING){ any_running = true; break; }
             }
             if(!any_running) break;
-
             int status;
             pid_t pid = waitpid(-1, &status, 0); //блокирующе ждём любого потомка
             if(pid < 0){
@@ -378,14 +369,12 @@ int my_wait(char** argv){
         jobs_remove();
         return 0;
     }
-
     //ждём конкретное задание/pid. Упрощение: ожидание идёт по pid ведущего
     //процесса задания (для одиночных фоновых команд этого достаточно;
     //отдельные процессы конвейера в фоне всё равно подбираются общим
     //обработчиком SIGCHLD/get_children).
     Job* job = NULL;
     pid_t target_pid;
-
     if(argv[1][0] == '%'){
         job = resolve_job_spec(argv[1]);
         if(!job){
@@ -403,7 +392,6 @@ int my_wait(char** argv){
         target_pid = (pid_t)pid;
         job = jobs_by_pgid(target_pid);
     }
-
     int status = 0;
     while(true){
         pid_t r = waitpid(target_pid, &status, 0);
@@ -415,42 +403,47 @@ int my_wait(char** argv){
         }
         break;
     }
-
     if(job) job->status = J_DONE;
-
     if(WIFEXITED(status)) return WEXITSTATUS(status);
     if(WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return 0;
 }
-
 int is_mybuilt(Node* node){
-    if(!node || node->type != NODE_CMD || node->argv == NULL || node->argv[0] == NULL) return 0;
+    if(!node || node->type != NODE_CMD || node->argv == NULL || node->argv[0] == NULL)
+     return 0;
     char* name = node->argv[0];
-
-    if(strcmp(name, "cd") == 0) return 1;
-    if(strcmp(name, "pwd") == 0) return 1;
-    if(strcmp(name, "export") == 0) return 1;
-    if(strcmp(name, "exit") == 0) return 1;
-    if(strcmp(name, "echo") == 0) return 1;
-    if(strcmp(name, "unset") == 0) return 1;
-    if(strcmp(name, "jobs") == 0) return 1;
-    if(strcmp(name, "fg") == 0) return 1;
-    if(strcmp(name, "bg") == 0) return 1;
-    if(strcmp(name, "help") == 0) return 1;
-    if(strcmp(name, "kill") == 0) return 1;
-    if(strcmp(name, "wait") == 0) return 1;
-
+    if(strcmp(name, "cd") == 0) 
+    return 1;
+    if(strcmp(name, "pwd") == 0) 
+    return 1;
+    if(strcmp(name, "export") == 0)
+     return 1;
+    if(strcmp(name, "exit") == 0)
+     return 1;
+    if(strcmp(name, "echo") == 0)
+     return 1;
+    if(strcmp(name, "unset") == 0)
+     return 1;
+    if(strcmp(name, "jobs") == 0) 
+    return 1;
+    if(strcmp(name, "fg") == 0)
+     return 1;
+    if(strcmp(name, "bg") == 0)
+     return 1;
+    if(strcmp(name, "help") == 0)
+     return 1;
+    if(strcmp(name, "kill") == 0) 
+    return 1;
+    if(strcmp(name, "wait") == 0) 
+    return 1;
     return 0;
 }
-
 int run_mybuilt(Node* node){
     if(!node || node->type != NODE_CMD || node->argv == NULL || node->argv[0] == NULL){
         fprintf(stderr, "Пустая команда или ошибка парсинга\n");
         return 1;
     }
-
     char* a = node->argv[0];
-
     if(strcmp(a, "cd") == 0) return my_cd(node->argv);
     if(strcmp(a, "pwd") == 0) return my_pwd();
     if(strcmp(a, "export") == 0) return my_export(node->argv);
@@ -463,6 +456,5 @@ int run_mybuilt(Node* node){
     if(strcmp(a, "help") == 0) return my_help();
     if(strcmp(a, "kill") == 0) return my_kill(node->argv);
     if(strcmp(a, "wait") == 0) return my_wait(node->argv);
-
     return 1; //команда не builtin, поэтому придется создавать shell'у отдельный процесс внешние команды типа ls -> для работы (exec)
 }

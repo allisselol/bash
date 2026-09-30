@@ -7,11 +7,9 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/wait.h>
-
 JobVec jobs = {NULL, 0, 0, 1};
 int current_job_id = -1;
 int previous_job_id = -1;
-
 //задание становится "текущим" (последнее добавленное или остановленное);
 //прежнее текущее сдвигается в "предыдущее"
 static void mark_current(int id){
@@ -19,15 +17,14 @@ static void mark_current(int id){
     previous_job_id = current_job_id;
     current_job_id = id;
 }
-
 //добавление задание
 Job* jobs_add(pid_t pgid, char* cmdline){
     if(jobs.count == jobs.capacity){
         if(jobs.capacity == 0){
             jobs.capacity = 16;
-        } else {
+    } else {
             jobs.capacity *= 2;
-        }
+    }
         jobs.vector = er_realloc(jobs.vector, jobs.capacity*sizeof(Job));
     }
     jobs.vector[jobs.count] = (Job){
@@ -81,9 +78,8 @@ void jobs_remove(void){
         jobs.next_id = 1;
         current_job_id = -1;
         previous_job_id = -1;
-    }
 }
-
+}
 Job* resolve_job_spec(const char* spec){
     if(!spec || !*spec) return NULL;
 
@@ -146,12 +142,10 @@ void get_children(void){
     }
     signchild = 0;
 }
-
 struct termios shell_settings;
 pid_t shell_pgid;
 int shell_terminal = -1; //пока не проинициализирован
 bool shell_interactive = false; //main.c выставит в true, если stdin - терминал
-
 int put_job_fg(Job* job, int continuee){    //continue - останавливался ли процесс
     int status = 0;
     pid_t process;
@@ -170,16 +164,13 @@ int put_job_fg(Job* job, int continuee){    //continue - останавлива�
             job->status = J_STOPPED;
             break;
         }
-
         if(WIFEXITED(status) || WIFSIGNALED(status)){
             job->status = J_DONE;
             break;
-        }
     }
-
+    }
     tcsetpgrp(shell_terminal, shell_pgid);
     tcsetattr(shell_terminal, TCSADRAIN, &shell_settings);
-
     if(WIFEXITED(status)){
         return WEXITSTATUS(status);
     } else {

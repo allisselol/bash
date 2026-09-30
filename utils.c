@@ -11,47 +11,42 @@
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
-
-char* cutter(char* s){
-    size_t n = strlen(s);
-    while(n && (s[n-1] == '\n' || s[n-1] == '\r')){
-        s[--n] = '\0';
+char* cutter(char* s){//Обрезает завершающие \n и \r у строки (нужна после getline, который их не убирает сам)
+    size_t n = strlen(s);//текущая длина строки
+    while(n && (s[n-1] == '\n' || s[n-1] == '\r')){//пока строка не пуста и последний символ - перевод строки
+        s[--n] = '\0';//уменьшаем n и сразу ставим туда терминатор
     }
     return s;
 }
 
 //получить текущую директорию //будет удобно в будущем для написания cd например
 char* gettingthiscwd(void){
-    size_t capacity = 256;
-    while(1){
-        char* buffer = er_malloc(capacity);
-        if(getcwd(buffer, capacity)){
+    size_t capacity = 256;//буфер
+    while(1){//растим буфер, пока не влезет
+        char* buffer = er_malloc(capacity);// выделяем буфер нужного размера
+        if(getcwd(buffer, capacity)){//пробуем прочитать cwd; успех - если вернулся не NULL
             return buffer;
-        }
-        free(buffer);
-        if(errno != ERANGE){
-            return er_strdup("?");
-        }
-        capacity *= 2; //если errno == ERANGE, тогда получается, что проблема в недостатке памяти
+        }// путь поместился, отдаём буфер как есть
+        free(buffer);// неудачная попытка - освобождаем буфер перед повтором
+        if(errno != ERANGE){   //какая то другая оштбка
+            return er_strdup("?"); // дальше пытаться бессмысленно, возвращаем заглушку
+        }capacity *= 2; //если errno == ERANGE, тогда получается, что проблема в недостатке памяти
     }
 }
-
-//соеденить директории, пути
-char* path_join(char* a, char* b){
-    size_t len_a = strlen(a), len_b = strlen(b);
-    bool need_stick = (len_a > 0 && a[len_a - 1] != '/');
-    char* r = er_malloc(len_a + need_stick + len_b + 1);
-    memcpy(r, a, len_a);
-    size_t stick = len_a;
+char* path_join(char* a, char* b){//соединить директории или пути
+    size_t len_a = strlen(a), len_b = strlen(b);//длины
+    bool need_stick = (len_a > 0 && a[len_a - 1] != '/');//нужен ли разделитель / 
+    char* r = er_malloc(len_a + need_stick + len_b + 1);//память выделяю пдд а + и тд
+    memcpy(r, a, len_a);// копируем a без завершающего нуля
+    size_t stick = len_a;// текущая позиция записи в результате
     if(need_stick == 1) r[stick++] = '/';
-    memcpy(r + stick, b, len_b + 1);
+    memcpy(r + stick, b, len_b + 1);// дописываем b вместе с его завершающим '\0'
     return r;
-}
+}//получается склеенная мтрока
 
 //получение полного пути к исполняемому файлу
 char* read_exe_path(void){
-#ifdef __APPLE__
-    //на macOS нет /proc, поэтому используем системный API mach-o
+#ifdef __APPLE__//на macOS нет /proc, поэтому использую системный API mach-o
     uint32_t size = 256;
     char* buffer = er_malloc(size);
     if(_NSGetExecutablePath(buffer, &size) == 0){

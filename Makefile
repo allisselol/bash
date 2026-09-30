@@ -11,25 +11,18 @@ OBJDIR = obj
 SRCS = main.c memory.c utils.c token.c lexer.c node.c parser.c jobs.c builtins.c exec.c
 OBJS = $(addprefix $(OBJDIR)/, $(SRCS:.c=.o))
 TARGET = mybash
-
 all: $(TARGET)
-
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(TARGET) $(OBJS) $(LDLIBS)
-
 # все .o собираются в папку obj/ (она создаётся автоматически, если её нет)
 $(OBJDIR)/%.o: %.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
-
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
-
 # сборка с диагностическими средствами (требование ТЗ): AddressSanitizer + UBSan + отладочная информация
 debug: CFLAGS += -fsanitize=address,undefined -g -O0
 debug: LDFLAGS += -fsanitize=address,undefined
 debug: clean $(TARGET)
-
 clean:
 	rm -rf $(OBJDIR) $(TARGET)
-
 .PHONY: all debug clean
