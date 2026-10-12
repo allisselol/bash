@@ -140,14 +140,16 @@ Node* parse_simple(Parser* p){
         // >&N <&N  echo hello >&2 перенаправь std_out в дескриптор std_err
         if(token->type == TOK_DUP_IN){// <&N
             int target_dup = token->fd;
+            int src_fd = token->fd2;// явный номер источника (N в N<&M); 0 - не указан
             get(p);
-            add_redir(node, (Redir){R_DUP_IN, 0, target_dup, NULL, NULL});// редирект stdin на другой fd
+            add_redir(node, (Redir){R_DUP_IN, src_fd, target_dup, NULL, NULL});// редирект fd src_fd (по умолчанию stdin) на другой fd
             continue;
         }
         if(token->type == TOK_DUP_OUT){// >&N
             int target_dup = token->fd;
+            int src_fd = token->fd2;// явный номер источника (N в N>&M); 0 - не указан, тогда при выполнении src<=1 = stdout
             get(p);
-            add_redir(node, (Redir){R_DUP_OUT, 1, target_dup, NULL, NULL});// редирект stdout на другой fd
+            add_redir(node, (Redir){R_DUP_OUT, src_fd, target_dup, NULL, NULL});// редирект fd src_fd (по умолчанию stdout) на другой fd
             continue;
         }
         if(token->type == TOK_HEREDOC){// <<EOF

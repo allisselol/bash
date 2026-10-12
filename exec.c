@@ -1,28 +1,35 @@
 #include "common.h" // _POSIX_C_SOURCE 200809L должен быть определён ДО системных заголовков
-#include "exec.h"
-#include "builtins.h"
-#include "jobs.h"
-#include "memory.h" // er_malloc (используется в run_builtin_with_redirs)
-#include "common.h" // BG_BLOCK_MS
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <signal.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <time.h>
-#include <sys/wait.h>
+#include "exec.h" // объявления функций этого модуля (run_node, do_redirs и т.д.)
+#include "builtins.h" // is_mybuilt / run_mybuilt - встроенные команды
+#include "jobs.h" // таблица заданий: jobs_add, jobs, J_STOPPED, shell_pgid, shell_settings, bg_until
+#include "memory.h" // обёртки er_malloc и др. (malloc с проверкой на NULL)
+#include "common.h" // повторное подключение (безвредно: внутри защита от повторного включения)
+#include <stdio.h> // fprintf, perror, printf, fflush
+#include <stdlib.h> // free
+#include <string.h> // strlen, strerror, memset
+#include <unistd.h> // fork, execvp, pipe, dup, dup2, close, write, setpgid, tcsetpgrp, _exit
+#include <signal.h> // signal, SIGINT, SIGTSTP, SIGQUIT, SIGTTIN, SIGTTOU
+#include <errno.h> // errno, ENOENT, ENOTDIR
+#include <fcntl.h> // open и флаги O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND
+#include <time.h> // clock_gettime, struct timespec
+#include <sys/wait.h> // waitpid, WIFEXITED, WEXITSTATUS, WIFSIGNALED, WTERMSIG, WIFSTOPPED, WUNTRACED
+
+//Истина в потомках ФОНОВЫХ заданий (запущенных с &). Такие процессы не имеют права
+//трогать терминал (tcsetpgrp) - иначе они отберут его у интерактивного шелла и у
+//текущего переднего плана, и шелл потеряет ввод. Флаг ставится в потомках фоновых
+//конструкций и по fork наследуется всеми вложенными процессами (вложенный конвейер,
+//подшелл, команда внутри них). В самом шелле остаётся false.
+static bool in_bg_job = false; // static - переменная видна только в этом файле; в самом шелле всегда false
 
 //Классификация ошибки после неудачного execvp, по ТЗ:
 //- команда не найдена (ENOENT/ENOTDIR - не найден сам файл или компонент пути) -> 127
 //- команда найдена, но не может быть выполнена (нет прав, это каталог,
 //  неверный формат исполняемого файла и т.п.) -> 126
 //Раньше здесь всегда безусловно возвращался 127, что не различало эти два случая.
-static int exec_fail_status(const char* name){
-    int code = (errno == ENOENT || errno == ENOTDIR) ? 127 : 126;
-    fprintf(stderr, "mysh: %s: %s\n", name, strerror(errno));
-    return code;
+static int exec_fail_status(const char* name){ // name - имя команды для сообщения об ошибке
+    int code = (errno == ENOENT || errno == ENOTDIR) ? 127 : 126; // errno выставил неудачный execvp; нет файла -> 127, иначе 126
+    fprintf(stderr, "mysh: %s: %s\n", name, strerror(errno)); // диагностика в stderr: "mysh: имя: текст ошибки"
+    return code; // вызывающий сделает _exit(code) - это и будет статус команды
 }
 
 //Общее ядро применения одного редиректа. Раньше это было прямо в do_one_redir
@@ -32,156 +39,157 @@ static int exec_fail_status(const char* name){
 //не убивать весь шелл, а просто отменить выполнение команды с кодом 1.
 //fatal=true  - поведение как раньше (для внешних команд в дочернем процессе)
 //fatal=false - печатает диагностику и возвращает false вместо _exit()
-static bool apply_redir(Redir* r, bool fatal){
-    int fd;
+static bool apply_redir(Redir* r, bool fatal){ // r - один редирект из списка; fatal - убивать ли процесс при ошибке
+    int fd; // временный дескриптор открытого файла
 
     // <
-    if(r->type == R_IN){
-        fd = open(r->target, O_RDONLY);
-        if(fd < 0){
-            if(fatal){ perror(r->target); _exit(1); }
-            fprintf(stderr, "mysh: %s: %s\n", r->target, strerror(errno));
-            return false;
+    if(r->type == R_IN){ // ввод из файла
+        fd = open(r->target, O_RDONLY); // открываем файл только для чтения
+        if(fd < 0){ // не открылся (нет файла, нет прав)
+            if(fatal){ perror(r->target); _exit(1); } // потомок: сообщение и немедленный выход с кодом 1
+            fprintf(stderr, "mysh: %s: %s\n", r->target, strerror(errno)); // builtin: только сообщение
+            return false; // сообщаем вызывающему, что редирект не удался
         }
-        int dest = (r->src <= 0) ? 0 : r->src;
-        if(dup2(fd, dest) < 0){
-            close(fd);
-            if(fatal){ perror("dup2"); _exit(1); }
-            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
-            return false;
+        int dest = (r->src <= 0) ? 0 : r->src; // какой дескриптор подменяем: по умолчанию stdin (0), иначе явный N из N<
+        if(dup2(fd, dest) < 0){ // делаем dest копией fd (теперь чтение из dest идёт из файла)
+            close(fd); // не утекает дескриптор при ошибке
+            if(fatal){ perror("dup2"); _exit(1); } // потомок: выход
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno)); // builtin: сообщение
+            return false; // ошибка
         }
-        close(fd);
+        close(fd); // оригинальный fd больше не нужен: копия живёт в dest
     }
 
     // > и >> (права 0666 с учётом umask процесса, как требует ТЗ - раньше
     // было жёстко захардкожено 0644, что игнорировало umask)
-    else if(r->type == R_OUT || r->type == R_APPEND){
-        int flags = O_WRONLY | O_CREAT | (r->type == R_APPEND ? O_APPEND : O_TRUNC);
-        fd = open(r->target, flags, 0666);
-        if(fd < 0){
-            if(fatal){ perror(r->target); _exit(1); }
-            fprintf(stderr, "mysh: %s: %s\n", r->target, strerror(errno));
-            return false;
+    else if(r->type == R_OUT || r->type == R_APPEND){ // вывод в файл: перезапись или дозапись
+        int flags = O_WRONLY | O_CREAT | (r->type == R_APPEND ? O_APPEND : O_TRUNC); // только запись, создать если нет, и обрезать (>) либо дописывать в конец (>>)
+        fd = open(r->target, flags, 0666); // 0666 & ~umask - итоговые права нового файла
+        if(fd < 0){ // не открылся
+            if(fatal){ perror(r->target); _exit(1); } // потомок: выход
+            fprintf(stderr, "mysh: %s: %s\n", r->target, strerror(errno)); // builtin: сообщение
+            return false; // ошибка
         }
-        int dest = (r->src <= 1) ? 1 : r->src;
-        if(dup2(fd, dest) < 0){
-            close(fd);
-            if(fatal){ perror("dup2"); _exit(1); }
-            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
-            return false;
+        int dest = (r->src <= 1) ? 1 : r->src; // по умолчанию stdout (1), иначе явный N из N> (например 2> )
+        if(dup2(fd, dest) < 0){ // подменяем dest файлом
+            close(fd); // закрываем, чтобы не утекал
+            if(fatal){ perror("dup2"); _exit(1); } // потомок: выход
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno)); // builtin: сообщение
+            return false; // ошибка
         }
-        close(fd);
+        close(fd); // лишний дескриптор не нужен
     }
 
     // &>
-    else if(r->type == R_ALL_TO_FILE){
-        fd = open(r->target, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if(fd < 0){
-            if(fatal){ perror(r->target); _exit(1); }
-            fprintf(stderr, "mysh: %s: %s\n", r->target, strerror(errno));
-            return false;
+    else if(r->type == R_ALL_TO_FILE){ // и stdout, и stderr в один файл
+        fd = open(r->target, O_WRONLY | O_CREAT | O_TRUNC, 0666); // открываем с перезаписью
+        if(fd < 0){ // не открылся
+            if(fatal){ perror(r->target); _exit(1); } // потомок: выход
+            fprintf(stderr, "mysh: %s: %s\n", r->target, strerror(errno)); // builtin: сообщение
+            return false; // ошибка
         }
-        if(dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0){
-            close(fd);
-            if(fatal){ perror("dup2"); _exit(1); }
-            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
-            return false;
+        if(dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0){ // и 1, и 2 становятся копиями файла
+            close(fd); // закрываем
+            if(fatal){ perror("dup2"); _exit(1); } // потомок: выход
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno)); // builtin: сообщение
+            return false; // ошибка
         }
-        close(fd);
+        close(fd); // оригинал не нужен
     }
 
     //дублирование вывода 2>&1 перенаправь std_err туда же куда и std_out
-    else if(r->type == R_DUP_OUT){
-        int dest = (r->src <= 1) ? 1 : r->src;
-        if(dup2(r->dup_target, dest) < 0){
-            if(fatal){ perror("dup2"); _exit(1); }
-            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
-            return false;
+    else if(r->type == R_DUP_OUT){ // N>&M
+        int dest = (r->src <= 1) ? 1 : r->src; // что перенаправляем (N); без N - stdout
+        if(dup2(r->dup_target, dest) < 0){ // dest становится копией дескриптора M (dup_target)
+            if(fatal){ perror("dup2"); _exit(1); } // потомок: выход (например M не открыт)
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno)); // builtin: сообщение
+            return false; // ошибка
         }
     }
 
     //Дублирование ввода <&N
-    else if(r->type == R_DUP_IN){
-        int dest = (r->src <= 0) ? 0 : r->src;
-        if(dup2(r->dup_target, dest) < 0){
-            if(fatal){ perror("dup2"); _exit(1); }
-            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
-            return false;
+    else if(r->type == R_DUP_IN){ // N<&M
+        int dest = (r->src <= 0) ? 0 : r->src; // что перенаправляем; без N - stdin
+        if(dup2(r->dup_target, dest) < 0){ // dest становится копией M
+            if(fatal){ perror("dup2"); _exit(1); } // потомок: выход
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno)); // builtin: сообщение
+            return false; // ошибка
         }
     }
 
     // <<EOF || // <<< "string smth"
-    else if(r->type == R_HEREDOC || r->type == R_HERESTR){
-        if(r->src > 0){
-            if(fatal){ fprintf(stderr, "Ввод только в stdin\n"); _exit(1); }
-            fprintf(stderr, "mysh: ввод только в stdin\n");
-            return false;
+    else if(r->type == R_HEREDOC || r->type == R_HERESTR){ // текст (не файл) подаём на stdin
+        if(r->src > 0){ // heredoc/herestring бывают только для stdin
+            if(fatal){ fprintf(stderr, "Ввод только в stdin\n"); _exit(1); } // потомок: сообщение и выход
+            fprintf(stderr, "mysh: ввод только в stdin\n"); // builtin: сообщение
+            return false; // ошибка
         }
 
-        int p[2];
-        if(pipe(p) < 0){
-            if(fatal){ perror("pipe"); _exit(1); }
-            fprintf(stderr, "mysh: pipe: %s\n", strerror(errno));
-            return false;
+        int p[2]; // p[0] - конец чтения, p[1] - конец записи
+        if(pipe(p) < 0){ // создаём канал, через который "протолкнём" текст
+            if(fatal){ perror("pipe"); _exit(1); } // потомок: выход
+            fprintf(stderr, "mysh: pipe: %s\n", strerror(errno)); // builtin: сообщение
+            return false; // ошибка
         }
 
-        size_t len = strlen(r->target);
-        if(len > 0) write(p[1], r->target, len);
-        close(p[1]);
+        size_t len = strlen(r->target); // длина текста heredoc / строки herestring
+        if(len > 0) write(p[1], r->target, len); // кладём текст в канал (ограничено размером буфера канала)
+        if(r->type == R_HERESTR) write(p[1], "\n", 1); //here-string, как в bash, заканчивается переводом строки
+        close(p[1]); // закрываем запись, чтобы читатель увидел EOF после текста
 
-        if(dup2(p[0], STDIN_FILENO) < 0){
-            close(p[0]);
-            if(fatal){ perror("dup2"); _exit(1); }
-            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno));
-            return false;
+        if(dup2(p[0], STDIN_FILENO) < 0){ // stdin становится концом чтения канала
+            close(p[0]); // закрываем чтение
+            if(fatal){ perror("dup2"); _exit(1); } // потомок: выход
+            fprintf(stderr, "mysh: dup2: %s\n", strerror(errno)); // builtin: сообщение
+            return false; // ошибка
         }
-        close(p[0]);
+        close(p[0]); // оригинал больше не нужен
     }
 
-    else {
-        if(fatal){
-            fprintf(stderr, "Неизвестный тип перенаправления\n");
-        } else {
-            fprintf(stderr, "mysh: неизвестный тип перенаправления\n");
-            return false;
+    else { // тип редиректа неизвестен (защитная ветка)
+        if(fatal){ // потомок
+            fprintf(stderr, "Неизвестный тип перенаправления\n"); // сообщаем, но не выходим (как в оригинале)
+        } else { // builtin
+            fprintf(stderr, "mysh: неизвестный тип перенаправления\n"); // сообщаем
+            return false; // и отменяем команду
         }
     }
 
-    return true;
+    return true; // все ветки успешны
 }
 
-void do_one_redir(Redir* r){
-    apply_redir(r, true);
+void do_one_redir(Redir* r){ // "фатальная" версия для потомков
+    apply_redir(r, true); // при ошибке процесс сам завершится
 }
 
 //"безопасная" версия для builtin без fork (см. run_builtin_with_redirs):
 //не завершает процесс интерпретатора при ошибке, а по ТЗ возвращает
 //диагностику и false, чтобы вызывающий код мог отменить команду с кодом 1
 bool do_one_redir_safe(Redir* r){
-    return apply_redir(r, false);
+    return apply_redir(r, false); // шелл не умирает, ошибка идёт через возвращаемое значение
 }
 
-int do_redirs(Redir* redir_list){
-    for(Redir* r = redir_list; r != NULL; r = r->next){
-        do_one_redir(r);
+int do_redirs(Redir* redir_list){ // применить весь список редиректов по порядку (порядок важен: >f 2>&1 != 2>&1 >f)
+    for(Redir* r = redir_list; r != NULL; r = r->next){ // обходим связный список
+        do_one_redir(r); // применяем очередной
     }
-    return 0;
+    return 0; // ошибки обрабатываются внутри (через _exit)
 }
 
 //вычисляет, какой именно файловый дескриптор процесса подменит данный
 //редирект (та же логика выбора dest, что и внутри apply_redir)
 static int redir_target_fd(Redir* r){
-    switch(r->type){
-        case R_IN:          return (r->src <= 0) ? 0 : r->src;
+    switch(r->type){ // выбор по типу редиректа
+        case R_IN:          return (r->src <= 0) ? 0 : r->src; // по умолчанию stdin
         case R_OUT:
-        case R_APPEND:      return (r->src <= 1) ? 1 : r->src;
-        case R_DUP_OUT:     return (r->src <= 1) ? 1 : r->src;
-        case R_DUP_IN:      return (r->src <= 0) ? 0 : r->src;
+        case R_APPEND:      return (r->src <= 1) ? 1 : r->src; // по умолчанию stdout
+        case R_DUP_OUT:     return (r->src <= 1) ? 1 : r->src; // по умолчанию stdout
+        case R_DUP_IN:      return (r->src <= 0) ? 0 : r->src; // по умолчанию stdin
         case R_HEREDOC:
-        case R_HERESTR:     return 0;
+        case R_HERESTR:     return 0; // всегда stdin
         case R_ALL_TO_FILE: return -1; //особый случай - трогает сразу 1 и 2, обрабатывается отдельно
     }
-    return -1;
+    return -1; // защитное значение, если тип неизвестен
 }
 
 //Выполнить builtin С редиректами БЕЗ fork - именно так требует ТЗ: "для
@@ -191,43 +199,43 @@ static int redir_target_fd(Redir* r){
 //дочерний процесс - из-за этого, например, `cd /tmp > log.txt` реально менял
 //каталog только у уже завершившегося потомка, а сам шелл оставался на месте.
 static int run_builtin_with_redirs(Node* node){
-    int count = 0;
-    for(Redir* r = node->redirs; r; r = r->next){
-        count += (r->type == R_ALL_TO_FILE) ? 2 : 1;
+    int count = 0; // сколько дескрипторов нужно сохранить
+    for(Redir* r = node->redirs; r; r = r->next){ // считаем по списку редиректов
+        count += (r->type == R_ALL_TO_FILE) ? 2 : 1; // &> затрагивает два дескриптора (1 и 2), остальные - один
     }
 
-    int* saved_fd = er_malloc((size_t)count * sizeof(int));
-    int* orig_fd  = er_malloc((size_t)count * sizeof(int));
-    int nsaved = 0;
+    int* saved_fd = er_malloc((size_t)count * sizeof(int)); // сюда пойдут копии исходных дескрипторов (результат dup)
+    int* orig_fd  = er_malloc((size_t)count * sizeof(int)); // а тут запомним, чьими копиями они являются
+    int nsaved = 0; // сколько уже сохранено
 
     //сохраняем исходные дескрипторы через dup ДО применения редиректов
-    for(Redir* r = node->redirs; r; r = r->next){
-        if(r->type == R_ALL_TO_FILE){
-            int fds[2] = {STDOUT_FILENO, STDERR_FILENO};
-            for(int i = 0; i < 2; i++){
-                orig_fd[nsaved]  = fds[i];
-                saved_fd[nsaved] = dup(fds[i]);
-                nsaved++;
+    for(Redir* r = node->redirs; r; r = r->next){ // снова обходим список
+        if(r->type == R_ALL_TO_FILE){ // особый случай: два дескриптора
+            int fds[2] = {STDOUT_FILENO, STDERR_FILENO}; // 1 и 2
+            for(int i = 0; i < 2; i++){ // сохраняем каждый
+                orig_fd[nsaved]  = fds[i]; // запоминаем номер
+                saved_fd[nsaved] = dup(fds[i]); // dup даёт новый дескриптор с тем же "хозяйством" (терминал/файл)
+                nsaved++; // следующий слот
             }
-        } else {
-            int fd = redir_target_fd(r);
-            orig_fd[nsaved]  = fd;
-            saved_fd[nsaved] = dup(fd);
-            nsaved++;
+        } else { // обычный редирект
+            int fd = redir_target_fd(r); // какой дескриптор он заменит
+            orig_fd[nsaved]  = fd; // запоминаем номер
+            saved_fd[nsaved] = dup(fd); // сохраняем копию
+            nsaved++; // следующий слот
         }
     }
 
     //применяем сами редиректы; при первой же ошибке открытия файла -
     //по ТЗ команда отменяется целиком, код возврата 1
-    bool ok = true;
-    for(Redir* r = node->redirs; r; r = r->next){
-        if(!do_one_redir_safe(r)){
-            ok = false;
-            break;
+    bool ok = true; // пока всё хорошо
+    for(Redir* r = node->redirs; r; r = r->next){ // по порядку
+        if(!do_one_redir_safe(r)){ // безопасная версия: шелл не завершается
+            ok = false; // запоминаем неудачу
+            break; // дальше не применяем
         }
     }
 
-    int status = ok ? run_mybuilt(node) : 1;
+    int status = ok ? run_mybuilt(node) : 1; // выполняем builtin в ЭТОМ процессе, либо код 1 если редирект не удался
 
     fflush(NULL); //критично: сбрасываем буферы ДО восстановления исходных
                   //дескрипторов - иначе буферизованный вывод builtin'а рискует
@@ -235,227 +243,260 @@ static int run_builtin_with_redirs(Node* node){
                   //флаше уже после dup2 назад) или вовсе потеряться
 
     //восстанавливаем исходные дескрипторы в обратном порядке
-    for(int i = nsaved - 1; i >= 0; i--){
-        dup2(saved_fd[i], orig_fd[i]);
-        close(saved_fd[i]);
+    for(int i = nsaved - 1; i >= 0; i--){ // обратный порядок на случай нескольких редиректов одного дескриптора
+        dup2(saved_fd[i], orig_fd[i]); // возвращаем оригинал на место
+        close(saved_fd[i]); // закрываем сохранённую копию
     }
-    free(saved_fd);
+    free(saved_fd); // освобождаем массивы
     free(orig_fd);
 
-    return status;
+    return status; // статус builtin
 }
 
-int run_command(Node* node){
-    if(node->argv == NULL || node->argv[0] == NULL){
+int run_command(Node* node){ // запуск одной простой команды (с аргументами и редиректами)
+    if(node->argv == NULL || node->argv[0] == NULL){ // нет ни одного слова
         return 0; //если в узле банально аргументов нет, но как бы вышли без ошибок
     }
 
-    if(is_mybuilt(node)){
+    if(is_mybuilt(node)){ // это встроенная команда (cd, exit, jobs ...)
         //builtin без конвейера всегда выполняется в самом процессе интерпретатора -
         //с редиректами (через dup, см. run_builtin_with_redirs) или без них
-        if(node->redirs == NULL){
-            return run_mybuilt(node);
+        if(node->redirs == NULL){ // редиректов нет
+            return run_mybuilt(node); // просто вызываем
         }
-        return run_builtin_with_redirs(node);
+        return run_builtin_with_redirs(node); // иначе с сохранением/восстановлением fd
     }
 
     fflush(NULL); // сбрасываем буферы ДО fork(), иначе child унаследует непропечатанный
                    // буфер родителя и может вывести его повторно
-    pid_t pid = fork();
-    if(pid < 0){
-        perror("fork");
+    pid_t pid = fork(); // создаём процесс для внешней команды
+    if(pid < 0){ // fork не удался
+        perror("fork"); // сообщение
         return 1; //вышли с ошибкой
     }
 
-    if(pid == 0){
-        setpgid(0, 0);
-        signal(SIGINT, SIG_DFL);
-        signal(SIGTSTP, SIG_DFL);
-        signal(SIGQUIT, SIG_DFL);
+    if(pid == 0){ //потомок
+        setpgid(0, 0); // создаём новую группу процессов (pgid = свой pid)
+        signal(SIGINT, SIG_DFL); // возвращаем стандартную реакцию на Ctrl+C (шелл их игнорирует, а игнор переживает exec)
+        signal(SIGTSTP, SIG_DFL); // Ctrl+Z
+        signal(SIGQUIT, SIG_DFL); /* Ctrl+\ */
         signal(SIGTTIN, SIG_DFL); //cat &
-        signal(SIGTTOU, SIG_DFL);
+        signal(SIGTTOU, SIG_DFL); // чтобы фоновая команда останавливалась при обращении к терминалу, как положено
 
-        if(node->redirs) do_redirs(node->redirs);
+        if(node->redirs) do_redirs(node->redirs); // применяем редиректы (при ошибке потомок завершится)
 
-        execvp(node->argv[0], node->argv);
-        _exit(exec_fail_status(node->argv[0]));
-    } else {
+        execvp(node->argv[0], node->argv); // заменяем образ процесса программой; при успехе сюда не возвращаемся
+        _exit(exec_fail_status(node->argv[0])); // exec не удался: сообщение и код 126/127; _exit, чтобы не сбрасывать копию буферов родителя
+    } else { // ---- РОДИТЕЛЬ (шелл) ----
 
-        setpgid(pid, pid);
-        if(isatty(STDIN_FILENO)){
+        setpgid(pid, pid); // дублируем setpgid в родителе, чтобы не зависеть от гонки: кто раньше выполнится
+        if(!in_bg_job && isatty(STDIN_FILENO)){ // терминал отдаём только если мы не фоновое задание и есть терминал
             tcsetpgrp(STDIN_FILENO, pid); //фоновые процессы не забирают терминал
         }
 
         int status = 0; //определяем на тот случай, если waitpid вышел с ошибкой, он не напишет ничего в status
-        if(waitpid(pid, &status, WUNTRACED) < 0){
-            perror("waitpid");
-            tcsetpgrp(STDIN_FILENO, shell_pgid);
-            tcsetattr(STDIN_FILENO, TCSADRAIN, &shell_settings);
-            return 1;
+        if(waitpid(pid, &status, WUNTRACED) < 0){ // ждём завершения ИЛИ остановки (WUNTRACED) потомка
+            perror("waitpid"); // ошибка ожидания
+            if(!in_bg_job){ // возвращаем терминал шеллу
+                tcsetpgrp(STDIN_FILENO, shell_pgid); // передний план снова у шелла
+                tcsetattr(STDIN_FILENO, TCSADRAIN, &shell_settings); // и настройки терминала шелла
+            }
+            return 1; // ошибка
         }
 
-        tcsetpgrp(STDIN_FILENO, shell_pgid);
-        tcsetattr(STDIN_FILENO, TCSADRAIN, &shell_settings);
-
-        if(WIFSTOPPED(status)){
-            Job* j = jobs_add(pid, node->argv[0]);
-            if(j) j->status = J_STOPPED;
-            return 128 + SIGTSTP;
+        if(!in_bg_job){ // потомок завершился или остановился - забираем терминал обратно
+            tcsetpgrp(STDIN_FILENO, shell_pgid); // передний план у шелла
+            tcsetattr(STDIN_FILENO, TCSADRAIN, &shell_settings); // восстанавливаем режим терминала (потомок мог его испортить)
         }
 
-        if(WIFEXITED(status)) return(WEXITSTATUS(status));
-        if(WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+        if(WIFSTOPPED(status)){ // процесс остановлен (Ctrl+Z), не завершён
+            Job* j = jobs_add(pid, node->argv[0]); // заносим в таблицу заданий
+            if(j) j->status = J_STOPPED; // помечаем как остановленное
+            return 128 + SIGTSTP; // статус как у сигнала остановки
+        }
+
+        if(WIFEXITED(status)) return(WEXITSTATUS(status)); // нормальный выход: возвращаем его код
+        if(WIFSIGNALED(status)) return 128 + WTERMSIG(status); // убит сигналом: 128 + номер сигнала
     }
-    return 0;
+    return 0; // сюда доходим лишь в редких случаях
+}
+
+//Выполнить один этап конвейера в УЖЕ созданном процессе (потомке run_pipeline).
+//Простая внешняя команда запускается через execvp прямо в этом процессе, без
+//второго fork. Раньше этап вызывал run_node -> run_command, который форкал ещё
+//раз и делал setpgid(0, 0): настоящая программа оказывалась в отдельной группе
+//вне группы конвейера (kill %n её не доставал), а процесс-прослойка забирал
+//терминал даже у ФОНОВОГО конвейера - после `sleep 100 | sleep 100 &` шелл
+//терял терминал и завершался. Остальные узлы (builtin, подшелл, вложенный
+//конвейер) выполняются через run_node. Функция не возвращается.
+static void run_stage(Node* n, char* cmdline){
+    if(n && n->type == NODE_CMD && n->argv && n->argv[0] && !is_mybuilt(n)){ // это простая ВНЕШНЯЯ команда
+        signal(SIGINT, SIG_DFL); // восстанавливаем стандартные сигналы
+        signal(SIGTSTP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGTTIN, SIG_DFL);
+        signal(SIGTTOU, SIG_DFL);
+        if(n->redirs) do_redirs(n->redirs); // редиректы применяются ПОСЛЕ dup2 на канал, поэтому >file перекрывает канал (как в bash)
+        execvp(n->argv[0], n->argv); // запускаем программу в этом же процессе
+        _exit(exec_fail_status(n->argv[0])); // не вышло: 126/127
+    }
+    int st = run_node(n, cmdline); // builtin / подшелл / вложенный конвейер: выполняем рекурсивно
+    fflush(NULL); //_exit не сбрасывает буферы stdio - без этого вывод builtin'а в канал теряется
+    _exit(st); // завершаем этот процесс-этап с полученным статусом
 }
 
 //реализуем наш конвейер
-int run_pipeline(Node* node, bool flag_bg, char* cmdline, pid_t* out_pgid){
-    int p[2];
-    pid_t left_pid, right_pid;
+int run_pipeline(Node* node, bool flag_bg, char* cmdline, pid_t* out_pgid){ // flag_bg - запуск в фоне; out_pgid - вернуть группу вызывающему
+    int p[2]; // канал между левой и правой частью
+    pid_t left_pid, right_pid; // pid обоих потомков
 
-    if(pipe(p) < 0){
+    if(pipe(p) < 0){ // создаём канал
         perror("pipe");
         return 1;
     }
     //для левой части дерева рекурсивно
-    fflush(NULL);
-    left_pid = fork();
-    if(left_pid < 0){
+    fflush(NULL); // сброс буферов перед fork
+    left_pid = fork(); // потомок для левой части
+    if(left_pid < 0){ // fork не удался
         perror("fork");
-        close(p[0]);
+        close(p[0]); // закрываем концы канала
         close(p[1]);
         return 1;
     }
-    if(left_pid == 0){
-        setpgid(0, 0);
-        if(!flag_bg) tcsetpgrp(STDIN_FILENO, getpid());
-        signal(SIGINT, SIG_DFL);
+    if(left_pid == 0){ // ---- левый потомок ----
+        setpgid(0, 0); // он становится лидером новой группы процессов конвейера
+        if(flag_bg) in_bg_job = true; // фон: больше не трогаем терминал (и все наши потомки тоже)
+        if(!in_bg_job) tcsetpgrp(STDIN_FILENO, getpid()); // передний план: отдаём терминал группе конвейера
+        signal(SIGINT, SIG_DFL); // стандартные реакции на Ctrl+C / Ctrl+Z
         signal(SIGTSTP, SIG_DFL);
-        dup2(p[1], STDOUT_FILENO);
-        close(p[0]); close(p[1]);
-        _exit(run_node(node->left, cmdline));
+        dup2(p[1], STDOUT_FILENO); // stdout -> запись в канал
+        close(p[0]); close(p[1]); // оригиналы каналов закрываем, иначе читатель не получит EOF
+        run_stage(node->left, cmdline); // выполняем левый этап (не возвращается)
     }
-    setpgid(left_pid, left_pid);
-    pid_t pg = left_pid;
+    setpgid(left_pid, left_pid); // родитель тоже ставит группу (защита от гонки)
+    pid_t pg = left_pid; // группа конвейера = pid левого процесса
 
     //для правой части дерева рекурсивно
-    fflush(NULL);
-    right_pid = fork();
-    if(right_pid < 0){
+    fflush(NULL); // сброс буферов перед вторым fork
+    right_pid = fork(); // потомок для правой части
+    if(right_pid < 0){ // fork не удался
         perror("fork");
         close(p[0]);
         close(p[1]);
         return 1;
     }
-    if(right_pid == 0){
+    if(right_pid == 0){ // ---- правый потомок ----
         setpgid(0, pg);  //говорим становится главным в группе процессов
-        if(!flag_bg) tcsetpgrp(STDIN_FILENO, pg);
+        if(flag_bg) in_bg_job = true; // фон - не трогаем терминал
+        if(!in_bg_job) tcsetpgrp(STDIN_FILENO, pg); // передний план: терминал группе pg
         signal(SIGINT, SIG_DFL);
         signal(SIGTSTP, SIG_DFL);
-        dup2(p[0], STDIN_FILENO);
-        close(p[0]); close(p[1]);
-        _exit(run_node(node->right, cmdline));
+        dup2(p[0], STDIN_FILENO); // stdin <- чтение из канала
+        close(p[0]); close(p[1]); // закрываем оригиналы
+        run_stage(node->right, cmdline); // выполняем правый этап
     }
-    setpgid(right_pid, pg);
+    setpgid(right_pid, pg); // родитель добавляет правого в группу
 
-    close(p[0]); close(p[1]);
-    if(out_pgid) *out_pgid = pg;
+    close(p[0]); close(p[1]); // родителю канал не нужен: иначе читатель не увидит EOF
+    if(out_pgid) *out_pgid = pg; // сообщаем группу вызывающему
 
-    if(flag_bg){
-        jobs_add(pg, cmdline);
-        printf("[%d] %d\n", jobs.vector[jobs.count -1].id, pg);
-        return 0;
-    } else {
+    if(flag_bg){ // фоновый конвейер: не ждём
+        jobs_add(pg, cmdline); // регистрируем задание
+        printf("[%d] %d\n", jobs.vector[jobs.count -1].id, pg); // печатаем "[номер] pgid"
+        return 0; // статус 0
+    } else { // передний план: ждём оба процесса
         int status1 = 0, status2 = 0;
-        if(waitpid(left_pid, &status1, 0) < 0){
+        if(waitpid(left_pid, &status1, 0) < 0){ // ждём левого
             perror("waitpid");
             return 1;
         }
 
-        if(waitpid(right_pid, &status2, 0) < 0){
+        if(waitpid(right_pid, &status2, 0) < 0){ // ждём правого
             perror("waitpid");
             return 1;
         }
 
-        if(WIFEXITED(status2)) return(WEXITSTATUS(status2));
-        if(WIFSIGNALED(status2)) return 128 + WTERMSIG(status2);
+        if(WIFEXITED(status2)) return(WEXITSTATUS(status2)); // статус конвейера = статус правого этапа
+        if(WIFSIGNALED(status2)) return 128 + WTERMSIG(status2); // убит сигналом
     }
     return 0;
 }
 
-int run_minishell(Node* node, bool flag_bg, char* cmdline, pid_t* out_pgid){
-    fflush(NULL);
-    pid_t pid = fork();
-    if(pid < 0){
+int run_minishell(Node* node, bool flag_bg, char* cmdline, pid_t* out_pgid){ // подшелл ( ... )
+    fflush(NULL); // сброс буферов
+    pid_t pid = fork(); // подшелл - отдельный процесс (изоляция cd, переменных)
+    if(pid < 0){ // fork не удался
         perror("fork");
         return 1;
     }
-    if(pid == 0){
-        setpgid(0, 0);
-        pid_t pg = getpid();
-        if(!flag_bg) tcsetpgrp(STDIN_FILENO, pg);
-        signal(SIGINT, SIG_DFL); signal(SIGTSTP, SIG_DFL);
-        if(node->redirs) do_redirs(node->redirs);
-        _exit(run_node(node->left, cmdline));
-    } else {
-        setpgid(pid, pid);
-        if(out_pgid) *out_pgid = pid;
-        if(flag_bg){
-            jobs_add(pid, cmdline);
-            printf("[%d] %d\n", jobs.vector[jobs.count -1].id, pid);
+    if(pid == 0){ // ---- потомок-подшелл ----
+        setpgid(0, 0); // своя группа
+        pid_t pg = getpid(); // её номер
+        if(flag_bg) in_bg_job = true; // фон - без терминала
+        if(!in_bg_job) tcsetpgrp(STDIN_FILENO, pg); // передний план - терминал группе
+        signal(SIGINT, SIG_DFL); signal(SIGTSTP, SIG_DFL); // стандартные реакции
+        if(node->redirs) do_redirs(node->redirs); // редиректы подшелла ( ... ) > file
+        int st = run_node(node->left, cmdline); // выполняем содержимое скобок
+        fflush(NULL); //_exit не сбрасывает буферы stdio - иначе вывод builtin'а в канал/файл теряется
+        _exit(st); // выходим с его статусом
+    } else { // ---- родитель ----
+        setpgid(pid, pid); // группа и со стороны родителя
+        if(out_pgid) *out_pgid = pid; // возвращаем pgid
+        if(flag_bg){ // в фоне - не ждём
+            jobs_add(pid, cmdline); // регистрируем задание
+            printf("[%d] %d\n", jobs.vector[jobs.count -1].id, pid); // "[номер] pid"
             return 0;
-        } else {
+        } else { // на переднем плане - ждём
             int status = 0;
-            if(waitpid(pid, &status, 0) < 0){
+            if(waitpid(pid, &status, 0) < 0){ // ждём подшелл
                 perror("waitpid");
                 return 1;
             }
 
-            if(WIFEXITED(status)) return(WEXITSTATUS(status));
-            if(WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+            if(WIFEXITED(status)) return(WEXITSTATUS(status)); // код выхода подшелла
+            if(WIFSIGNALED(status)) return 128 + WTERMSIG(status); // убит сигналом
         }
     }
     return 0;
 }
 
 //самая главная функция в нашем коде, именно ради нее и было все написано
-int run_node(Node* node, char* cmdline){
-    if(!node) return 0;
+int run_node(Node* node, char* cmdline){ // обход дерева разбора; cmdline - исходная строка (для имени задания)
+    if(!node) return 0; // пустое дерево - успех
 
-    if(node->type == NODE_CMD) return run_command(node);
+    if(node->type == NODE_CMD) return run_command(node); // простая команда
 
-    else if(node->type == NODE_PIPE) return run_pipeline(node, false, cmdline, NULL);
+    else if(node->type == NODE_PIPE) return run_pipeline(node, false, cmdline, NULL); // конвейер на переднем плане
 
-    else if(node->type == NODE_AND){
-        int status = run_node(node->left, cmdline);
-        if(status == 0) status = run_node(node->right, cmdline);
+    else if(node->type == NODE_AND){ // a && b
+        int status = run_node(node->left, cmdline); // выполняем левую часть
+        if(status == 0) status = run_node(node->right, cmdline); // правую - только при успехе левой
+        return status; // статус последней выполненной
+    }
+
+    else if(node->type == NODE_OR){ // a || b
+        int status = run_node(node->left, cmdline); // левая часть
+        if(status != 0) status = run_node(node->right, cmdline); // правая - только при неудаче левой
         return status;
     }
 
-    else if(node->type == NODE_OR){
-        int status = run_node(node->left, cmdline);
-        if(status != 0) status = run_node(node->right, cmdline);
-        return status;
+    else if(node->type == NODE_SEQ){ // a ; b
+        run_node(node->left, cmdline); // статус левой игнорируется
+        return run_node(node->right, cmdline); // результат - статус правой
     }
 
-    else if(node->type == NODE_SEQ){
-        run_node(node->left, cmdline);
-        return run_node(node->right, cmdline);
-    }
+    else if(node->type == NODE_BG){ // a &
+        int tmp = 0; pid_t pgid = -1; // статус запуска (не используется) и pgid задания
 
-    else if(node->type == NODE_BG){
-        int tmp = 0; pid_t pgid = -1;
-
-        if(node->left->type == NODE_PIPE){
+        if(node->left->type == NODE_PIPE){ // фоновый конвейер
             tmp = run_pipeline(node->left, true, cmdline, &pgid);
 
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            add_ms(now, BG_BLOCK_MS, &bg_until);
+            struct timespec now; // момент запуска
+            clock_gettime(CLOCK_MONOTONIC, &now); // монотонные часы (не зависят от перевода времени)
+            add_ms(now, BG_BLOCK_MS, &bg_until); // на короткое время блокируем приглашение, чтобы вывод "[1] pid" не затёрся
         }
 
-        else if(node->left->type == NODE_MINISHELL){
+        else if(node->left->type == NODE_MINISHELL){ // фоновый подшелл ( ... ) &
             tmp = run_minishell(node->left, true, cmdline, &pgid);
 
             struct timespec now;
@@ -463,38 +504,38 @@ int run_node(Node* node, char* cmdline){
             add_ms(now, BG_BLOCK_MS, &bg_until);
         }
 
-        else if(node->left->type == NODE_CMD){
-            fflush(NULL);
-            pid_t pid = fork();
+        else if(node->left->type == NODE_CMD){ // фоновая простая команда
+            fflush(NULL); // сброс буферов
+            pid_t pid = fork(); // отдельный процесс
 
-            if(pid < 0){
+            if(pid < 0){ // fork не удался
                 perror("fork");
                 return 1;  //банально ошибка создания процесса
             }
 
-            else if(pid == 0){
-                setpgid(0, 0);
-                signal(SIGINT, SIG_DFL);
+            else if(pid == 0){ // ---- потомок ----
+                setpgid(0, 0); // своя группа (не передний план)
+                signal(SIGINT, SIG_DFL); // стандартные сигналы
                 signal(SIGTSTP, SIG_DFL);
                 signal(SIGQUIT, SIG_DFL);
 
-                Node* cmd = node->left;
+                Node* cmd = node->left; // сама команда
 
-                if(cmd->redirs) do_redirs(cmd->redirs);
+                if(cmd->redirs) do_redirs(cmd->redirs); // редиректы
 
-                if(is_mybuilt(cmd)){
+                if(is_mybuilt(cmd)){ // builtin в фоне - выполняется в этом потомке
                     int built_command = run_mybuilt(cmd);
                     fflush(NULL); // та же причина: без сброса буферов вывод в редирект теряется
                     _exit(built_command);
                 }
 
-                execvp(cmd->argv[0], cmd->argv);
-                _exit(exec_fail_status(cmd->argv[0]));
+                execvp(cmd->argv[0], cmd->argv); // внешняя команда
+                _exit(exec_fail_status(cmd->argv[0])); // не вышло: 126/127
             }
-            else {
-                setpgid(pid, pid);
-                jobs_add(pid, cmdline);
-                printf("[%d] %d\n", jobs.vector[jobs.count -1].id, pid);
+            else { //родитель 
+                setpgid(pid, pid); // группа и с этой стороны
+                jobs_add(pid, cmdline); // регистрируем задание
+                printf("[%d] %d\n", jobs.vector[jobs.count -1].id, pid); // "[номер] pid"
 
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
@@ -502,16 +543,30 @@ int run_node(Node* node, char* cmdline){
             }
         }
 
-        else tmp = run_minishell(node->left, true, cmdline, &pgid);
+        else {
+            //&&, ||, ; (и всё прочее) под &: выражение выполняется целиком в фоновом
+            //подшелле. run_minishell исполняет node->left УЗЛА-подшелла, поэтому
+            //оборачиваем выражение во временный узел NODE_MINISHELL. Раньше сюда
+            //передавался сам узел AND/OR/SEQ, и в фоне выполнялась только его левая часть
+            Node wrapper; // временный узел на стеке
+            memset(&wrapper, 0, sizeof(wrapper)); // обнуляем все поля (redirs = NULL и т.д.)
+            wrapper.type = NODE_MINISHELL; // притворяемся подшеллом
+            wrapper.left = node->left; // внутри - всё выражение
+            tmp = run_minishell(&wrapper, true, cmdline, &pgid); // запускаем в фоне
 
-        (void)tmp;
-        if(node->right) return run_node(node->right, cmdline);
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            add_ms(now, BG_BLOCK_MS, &bg_until);
+        }
+
+        (void)tmp; // подавляем предупреждение "переменная не используется"
+        if(node->right) return run_node(node->right, cmdline); // после & может идти продолжение (a & b)
         return 0;
     }
 
-    else if(node->type == NODE_MINISHELL) return run_minishell(node, false, cmdline, NULL);
+    else if(node->type == NODE_MINISHELL) return run_minishell(node, false, cmdline, NULL); // подшелл на переднем плане
 
     else {
-        return 1; //неизвестный тип
+        return 1;
     }
 }

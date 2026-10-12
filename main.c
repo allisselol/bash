@@ -312,6 +312,12 @@ int main(int argc, char** argv){
         return last_exit_status;
     }
     while(true){//основной цикл
+        if(interactive){
+            //после конвейера/подшелла терминал мог остаться за их группой процессов -
+            //возвращаем его шеллу, иначе чтение ввода идёт из фоновой группы и падает
+            tcsetpgrp(shell_terminal, shell_pgid);
+            tcsetattr(shell_terminal, TCSADRAIN, &shell_settings);
+        }
         get_children();
         jobs_remove();
         maybe_soft_block_prompt();

@@ -23,6 +23,7 @@ typedef struct{
     TokenType type;
     char* value;
     int fd;
+    int fd2;
 } Token;
 
 typedef struct{

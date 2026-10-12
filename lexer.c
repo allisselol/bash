@@ -35,7 +35,7 @@ void skip_spaces(Cursor* c){//скипаю пробелы
         c->position++;
     }
 }
-bool match_symbol(Cursor* c, char* z){//проверка строки с подстрокой
+bool match_symbol(Cursor* c, char* z){// проверяем, совпадает ли текущая позиция с заданной строкой z (например, "&&" или "||")
     size_t len = strlen(z);// длина искомого оператора (например, "&&" -> 2)
     if(c->position + len > c->length) return false;// если оставшейся части строки не хватает по длине - сразу false
     if(strncmp(c->s + c->position, z, len) == 0){// сравниваем len байт от текущей позиции со строкой z
@@ -423,29 +423,29 @@ void lexer(char* line, TokenVector* tv){
         if(cur_see(&cur) == '#') break;
 
         if(match_symbol(&cur, "&&")){   //если попадание match_symbol как и все другие функции сдвигает каретку(курсор)(указатель) нашей строки
-            tv_push(tv, (Token){TOK_AND, NULL, -1});
+            tv_push(tv, (Token){TOK_AND, NULL, -1, 0});
             continue;
         }
 
         if(match_symbol(&cur, "||")){
-            tv_push(tv, (Token){TOK_OR, NULL, -1});
+            tv_push(tv, (Token){TOK_OR, NULL, -1, 0});
             continue;
         }
 
         if(match_symbol(&cur, "<<<")){
-            tv_push(tv, (Token){TOK_HERESTR, NULL, -1});  //передает строку на stdin команды echo "smth" | cat - доп pipe
+            tv_push(tv, (Token){TOK_HERESTR, NULL, -1, 0});  //передает строку на stdin команды echo "smth" | cat - доп pipe
             continue;
         }
         if(match_symbol(&cur, "<<")){// проверяется ПОСЛЕ "<<<" - иначе тройной оператор был бы разбит неверно
-            tv_push(tv, (Token){TOK_HEREDOC, NULL, -1});
+            tv_push(tv, (Token){TOK_HEREDOC, NULL, -1, 0});
             continue;
         }
         if(match_symbol(&cur, ">>")){
-            tv_push(tv, (Token){TOK_REDIR_OUT_APP, NULL, -1});  //дозапись в конец файла
+            tv_push(tv, (Token){TOK_REDIR_OUT_APP, NULL, -1, 0});  //дозапись в конец файла
             continue;
         }
         if(match_symbol(&cur, "&>")){
-            tv_push(tv, (Token){TOK_ALL_TO_FILE, NULL, -1});  //И std_out и ошибки std_err в один файл
+            tv_push(tv, (Token){TOK_ALL_TO_FILE, NULL, -1, 0});  //И std_out и ошибки std_err в один файл
             continue;
         }
         if(match_symbol(&cur, ">&")){  //дублирует std_out в файловый дескриптор с нужным номером >&N
@@ -454,10 +454,10 @@ void lexer(char* line, TokenVector* tv){
                 if(number > 2) {
                     fprintf(stderr, "Недопустимый формат дескриптора\n");
                 }
-                tv_push(tv, (Token){TOK_DUP_OUT, NULL, number});// передаёт std_out в другой файловый дескриптор
+                tv_push(tv, (Token){TOK_DUP_OUT, NULL, number, 0});// передаёт std_out в другой файловый дескриптор
                 continue;
             }
-            tv_push(tv, (Token){TOK_WORD, er_strdup(">&"), -1});  //передаем как слово
+            tv_push(tv, (Token){TOK_WORD, er_strdup(">&"), -1, 0});  //передаем как слово
             continue;
         }
         if(match_symbol(&cur, "<&")){  //Дублирует std_in // допустим <&3 читаем ввод из другого дескриптора
@@ -466,64 +466,86 @@ void lexer(char* line, TokenVector* tv){
                 if(number > 2) {
                     fprintf(stderr, "Недопустимый формат дескриптора\n");
                 }
-                tv_push(tv, (Token){TOK_DUP_IN, NULL, number});
+                tv_push(tv, (Token){TOK_DUP_IN, NULL, number, 0});
                 continue;
             }
-            tv_push(tv, (Token){TOK_WORD, er_strdup("<&"), -1});  //передаем как слово
+            tv_push(tv, (Token){TOK_WORD, er_strdup("<&"), -1, 0});  //передаем как слово
             continue;
         }
         //однокомандные
         if(match_symbol(&cur, "|")){
-            tv_push(tv, (Token){TOK_PIPE, NULL, -1});
+            tv_push(tv, (Token){TOK_PIPE, NULL, -1, 0});
             continue;}
         if(match_symbol(&cur, ";")){
-            tv_push(tv, (Token){TOK_SEMI, NULL, -1});
+            tv_push(tv, (Token){TOK_SEMI, NULL, -1, 0});
             continue;
         }
         if(match_symbol(&cur, "&")){// проверяется ПОСЛЕ "&&" и "&>" - только одиночный "&" доходит сюда
-            tv_push(tv, (Token){TOK_BG, NULL, -1});
+            tv_push(tv, (Token){TOK_BG, NULL, -1, 0});
             continue;
         }
         //отдельный дочерний бaш, со своей отдельной директорией и окружением
         if(match_symbol(&cur, "(")){
-            tv_push(tv, (Token){TOK_LPAREN, NULL, -1});
+            tv_push(tv, (Token){TOK_LPAREN, NULL, -1, 0});
             continue;
         }
         if(match_symbol(&cur, ")")){
-            tv_push(tv, (Token){TOK_RPAREN, NULL, -1});
+            tv_push(tv, (Token){TOK_RPAREN, NULL, -1, 0});
             continue;
         }
         if(match_symbol(&cur, ">")){// проверяется ПОСЛЕ ">>" и "&>" и ">&" - только одиночный ">"
-            tv_push(tv, (Token){TOK_REDIR_OUT, NULL, -1});  //перенаправляет стандартный std_out echo smth > file.txt
+            tv_push(tv, (Token){TOK_REDIR_OUT, NULL, -1, 0});  //перенаправляет стандартный std_out echo smth > file.txt
             continue;
         }
         if(match_symbol(&cur, "<")){// проверяется ПОСЛЕ "<<<", "<<", "<&" - только одиночный "<"
-            tv_push(tv, (Token){TOK_REDIR_IN, NULL, -1});  //перенаправляет std_in ws -l < file.txt
+            tv_push(tv, (Token){TOK_REDIR_IN, NULL, -1, 0});  //перенаправляет std_in ws -l < file.txt
             continue;
         }
         size_t save_position = cur.position;//запоминаем позицию на случай отката
         int fd = read_number(&cur);//пробуем прочитать число (потенциальный номер fd)
         if(fd >= 0){
+            size_t after_number = cur.position;//позиция сразу после цифр - для отката
+            //N>&M и N<&M: дублирование с ЯВНЫМ номером источника (2>&1, 1>&2, 3<&0).
+            //Номер M кладём в fd, номер N - в fd2 (раньше работала только форма >&M без N,
+            //а самая частая 2>&1 разбиралась как "2>", затем "&" (фон) и давала синтаксическую ошибку)
+            if(match_symbol(&cur, ">&")){
+                int target = read_number(&cur);
+                if(target >= 0){
+                    if(fd > 2 || target > 2) fprintf(stderr, "Недопустимый файловый дескриптор\n");
+                    tv_push(tv, (Token){TOK_DUP_OUT, NULL, target, fd});
+                    continue;
+                }
+                cur.position = after_number;//после >& нет числа - откатываемся и разбираем как раньше
+            }
+            if(match_symbol(&cur, "<&")){
+                int target = read_number(&cur);
+                if(target >= 0){
+                    if(fd > 2 || target > 2) fprintf(stderr, "Недопустимый файловый дескриптор\n");
+                    tv_push(tv, (Token){TOK_DUP_IN, NULL, target, fd});
+                    continue;
+                }
+                cur.position = after_number;
+            }
             if(match_symbol(&cur, ">>")){
                 if(fd > 2) fprintf(stderr, "Недопустимый файловый дескриптор\n");
-                tv_push(tv, (Token){TOK_FD_REDIR_OUT_APP, NULL, fd}); //тоже самое что и N> только дозапись
+                tv_push(tv, (Token){TOK_FD_REDIR_OUT_APP, NULL, fd, 0}); //тоже самое что и N> только дозапись
                 continue;
             }
             if(match_symbol(&cur, ">")){
                 if(fd > 2) fprintf(stderr, "Недопустимый файловый дескриптор\n");
-                tv_push(tv, (Token){TOK_FD_REDIR_OUT, NULL, fd}); // echo privet 1> file.txt перезапишется в файл вместо вывода в консоль
+                tv_push(tv, (Token){TOK_FD_REDIR_OUT, NULL, fd, 0}); // echo privet 1> file.txt перезапишется в файл вместо вывода в консоль
                 continue;
             }
             if(match_symbol(&cur, "<")){
                 if(fd > 2) fprintf(stderr, "Недопустимый файловый дескриптор\n");
-                tv_push(tv, (Token){TOK_FD_REDIR_IN, NULL, fd}); // Ввод с файла в дескриптор допустим sort (0< file.txt) - обычный ввод заменяется чтение из файла
+                tv_push(tv, (Token){TOK_FD_REDIR_IN, NULL, fd, 0}); // Ввод с файла в дескриптор допустим sort (0< file.txt) - обычный ввод заменяется чтение из файла
                 continue;
             }
             cur.position = save_position;// после числа не нашлось >>/>/< - это было не число-fd, откатываемся
         }
         char* word = read_words(&cur); // пробуем прочитать обычное слово (со всеми подстановками)
         if(word){
-            tv_push(tv, (Token){TOK_WORD, word, -1});
+            tv_push(tv, (Token){TOK_WORD, word, -1, 0});
             continue;
         }
         if(!cur_eof(&cur)){// слово не получилось прочитать, но строка ещё не кончилась - тупик
@@ -534,5 +556,5 @@ void lexer(char* line, TokenVector* tv){
             break; //строка целиком отвергается как ошибочная - дальше не токенизируем
         }
     }
-    tv_push(tv, (Token){TOK_END, NULL, -1});// добавляем токен конца потока, чтобы парсер знал, что токены закончились
+    tv_push(tv, (Token){TOK_END, NULL, -1, 0});// добавляем токен конца потока, чтобы парсер знал, что токены закончились
 }
