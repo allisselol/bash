@@ -289,21 +289,21 @@ Node* parse_line(Parser* p){
         Node* term = parse_and_or(p); // "терм" на этом уровне - целая цепочка &&/||
         if(!term){
             if(syntax_error_flag){
-                free_node(result); // реальная ошибка - освобождаем всё, что успели накопить
+                free_node(result); // реальная ошибка
                 return NULL;
             }
             break; //настоящий конец ввода - команд больше нет, это не ошибка
         }
         bool had_bg = false;
-        if(accept(p, TOK_BG)){           // сразу после терма стоит "&" - фоновый запуск
+        if(accept(p, TOK_BG)){ // сразу после терма стоит "&" - фоновый запуск
             Node* bg = new_node(NODE_BG);
             bg->left  = term;
             bg->right = NULL;
-            term = bg;                     // заменяем term на обёртку NODE_BG
+            term = bg; // заменяем term на обёртку NODE_BG
             had_bg = true;
         }
         if(!result){
-            result = term;                  // первый терм - просто становится накопителем
+            result = term; // первый терм - просто становится накопителем
         } else {
             Node* seq = new_node(NODE_SEQ); // следующие термы оборачиваются в NODE_SEQ
             seq->left  = result;
