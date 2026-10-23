@@ -1,0 +1,18 @@
+echo hello | tr a-z A-Z                  # HELLO
+ls /nonexistent > /tmp/e.txt 2>&1 ; cat /tmp/e.txt    # сообщение об ошибке попало в файл (ls -l /tmp/e.txt)
+cat <<< "строка из here-string"          # строка из here-string
+(cd /tmp; pwd) ; pwd                     # /tmp, затем прежний каталог (подшелл изолирован)
+false || echo "сработало ||"             # сработало ||
+nosuchcmd                                # сообщение, код 127
+echo $?                                  # 127
+sleep 100                                # нажать Ctrl+C - приглашение вернулось
+sleep 100                                # нажать Ctrl+Z - [1]+ Stopped
+jobs                                     # [1]+ Stopped
+bg                                       # продолжилось в фоне
+jobs                                     # [1]+ Running
+fg                                       # снова на переднем плане; Ctrl+C - завершить
+sleep 100 | sleep 100 &                  # фоновый конвейер; шелл остаётся жив
+jobs                                     # виден в списке
+kill %1                                  # завершить задание
+echo -n без_перевода_строки              # следующее приглашение начинается с новой строки
+exit 3                                   # затем в терминале: echo $?  -> 3
