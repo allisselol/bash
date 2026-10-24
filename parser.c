@@ -55,7 +55,7 @@ char* heredoc(char* end_pointer){// Читает многострочный вв
         buffer[count] = '\0';// сразу терминируем на промежуточном шаге, чтобы можно было безопасно использовать buffer как строку
         free(line);
     }
-    return buffer;// весь собранный текст heredoc (без финальной строки-метки)
+    return buffer;
 }
 char* expect_word(Parser* p){//следующий токен ОБЯЗАТЕЛЬНО должен быть словом
     if(syntax_error_flag) return NULL;
@@ -91,7 +91,7 @@ Node* parse_simple(Parser* p){
             get(p);
             continue;
         }
-        if(token->type == TOK_REDIR_IN){// < input.txt
+        if(token->type == TOK_REDIR_IN){//< input.txt 
             get(p);
             add_redir_file(p, node, R_IN, 0);// читаем имя файла и прикрепляем редирект на fd 0 (stdin)
             if(syntax_error_flag) break;
@@ -282,8 +282,8 @@ Node* parse_and_or(Parser* p){
     }
     return left;
 }
-// ; &
-Node* parse_line(Parser* p){
+// ; & - а терм то что стоит между ; или &
+Node* parse_line(Parser* p){ 
     Node* result = NULL; // накопитель - стартует пустым, в отличие от нижних уровней
     while(1){
         Node* term = parse_and_or(p); // "терм" на этом уровне - целая цепочка &&/||
@@ -292,22 +292,22 @@ Node* parse_line(Parser* p){
                 free_node(result); // реальная ошибка
                 return NULL;
             }
-            break; //настоящий конец ввода - команд больше нет, это не ошибка
+            break;
         }
-        bool had_bg = false;
+        bool had_bg = false;// флаг: встретили ли "&" сразу после терма
         if(accept(p, TOK_BG)){ // сразу после терма стоит "&" - фоновый запуск
             Node* bg = new_node(NODE_BG);
-            bg->left  = term;
+            bg->left  = term;// левая ветка - сама команда, которая будет выполняться в фоне
             bg->right = NULL;
             term = bg; // заменяем term на обёртку NODE_BG
             had_bg = true;
         }
         if(!result){
-            result = term; // первый терм - просто становится накопителем
+            result = term; // первый терм - просто присваиваем
         } else {
-            Node* seq = new_node(NODE_SEQ); // следующие термы оборачиваются в NODE_SEQ
+            Node* seq = new_node(NODE_SEQ); // следующие термы оборачиваются в NODE_SEQ (;)
             seq->left  = result;
-            seq->right = term;
+            seq->right = term;// левая ветка - уже накопленное дерево, правая - новый терм
             result = seq;
         }
         if(accept(p, TOK_SEMI)) continue; // явный разделитель ";" - ищем следующий терм

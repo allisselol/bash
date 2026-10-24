@@ -36,7 +36,7 @@ const char* token_type_name(TokenType type){
         case TOK_FD_REDIR_OUT: return "FD_REDIR_OUT"; // N>
         case TOK_FD_REDIR_OUT_APP: return "FD_REDIR_OUT_APP";// N>>
         case TOK_FD_REDIR_IN: return "FD_REDIR_IN";  // N
-        case TOK_END: return "END"; // конец потока токенов
+        case TOK_END: return "END";
     }return "UNKNOWN"; // защита: если добавили новый TokenType, но забыли case - не падаем и не читаем мусор
 }
 bool syntax_error_flag = false; // глобальный флаг: была ли синтаксическая ошибка при разборе текущей строки

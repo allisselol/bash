@@ -1,0 +1,12 @@
+builtins.c
+exec.c
+exec.h
+jobs.c
+lexer.c
+lexer.c.bak
+main.c
+memory.c
+node.c
+parser.c
+token.c
+utils.c
