@@ -281,7 +281,7 @@ int main(int argc, char** argv){
     if(dash_c_command){ // режим -c
         shell_interactive = false; // принудительно неинтерактивный
         last_exit_status = process_line(dash_c_command, true); // выполняем одну строку
-        for(int i = 0; i < jobs.count; i++) free(jobs.vector[i].cmdline); // освобождаем имена заданий
+        for(int i = 0; i < jobs.count; i++){ free(jobs.vector[i].cmdline); free(jobs.vector[i].procs); } // освобождаем имена заданий и списки их процессов
         free(jobs.vector); // и таблицу
         return last_exit_status; // код последней команды
     }
@@ -315,6 +315,7 @@ int main(int argc, char** argv){
             free(line);
             continue; // сразу новое приглашение
         }
+        get_children(); //пока ждали ввод, фоновые процессы могли завершиться: убираем зомби ДО запуска команды (иначе ps покажет <defunct>)
         last_exit_status = process_line(line, true); // выполняем и запоминаем статус (для $? и итогового кода)
         if(last_exit_status == 2 && syntax_error_flag && !interactive){ // синтаксическая ошибка в неинтерактивном режиме
             //неинтерактивный режим: синтаксическая ошибка прерывает выполнение
@@ -326,6 +327,7 @@ int main(int argc, char** argv){
     }
     for(int i = 0; i < jobs.count; i++){ // очистка перед выходом
         free(jobs.vector[i].cmdline); // имя каждого задания
+        free(jobs.vector[i].procs); // и список его процессов
     }
     free(jobs.vector); // таблица заданий
     return last_exit_status; // итоговый код шелла - статус последней команды

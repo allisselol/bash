@@ -13,11 +13,25 @@ typedef enum {
     J_STOPPED
 } Jobstate;
 
+//один процесс задания (у конвейера их несколько); статус задания считается из статусов его процессов
+typedef enum {
+    P_RUNNING,
+    P_STOPPED,
+    P_DONE
+} ProcState;
+
+typedef struct {
+    pid_t pid;
+    ProcState state;
+} Proc;
+
 typedef struct {
     int id;
     pid_t pgid;
     char* cmdline;
     Jobstate status;
+    Proc* procs;   //процессы задания
+    int nprocs;    //сколько их
 } Job;
 
 typedef struct {
@@ -37,6 +51,9 @@ extern int previous_job_id;
 
 //добавление задания
 Job* jobs_add(pid_t pgid, char* cmdline);
+void job_set_procs(Job* job, const pid_t* pids, int n);  //запомнить pid каждого этапа конвейера
+void job_note_event(Job* job, pid_t pid, int status);    //учесть событие waitpid для одного процесса
+void job_all_running(Job* job);                          //группе послали SIGCONT
 Job* jobs_by_id(int id);
 Job* jobs_by_pgid(pid_t pgid);
 void jobs_remove(void);

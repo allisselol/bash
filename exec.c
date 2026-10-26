@@ -258,8 +258,18 @@ int run_command(Node* node){ // запуск одной простой кома�
             tcsetattr(STDIN_FILENO, TCSADRAIN, &shell_settings); // восстанавливаем режим терминала (потомок мог его испортить)
         }
         if(WIFSTOPPED(status)){ // процесс остановлен (Ctrl+Z), не завершён
-            Job* j = jobs_add(pid, node->argv[0]); // заносим в таблицу заданий
-            if(j) j->status = J_STOPPED; // помечаем как остановленное
+            //имя задания - вся команда с аргументами ("sleep 100"), а не только argv[0]
+            size_t len = 1;
+            for(int a = 0; node->argv[a]; a++) len += strlen(node->argv[a]) + 1;
+            char* name = er_malloc(len);
+            name[0] = '\0';
+            for(int a = 0; node->argv[a]; a++){
+                if(a) strcat(name, " ");
+                strcat(name, node->argv[a]);
+            }
+            Job* j = jobs_add(pid, name); // заносим в таблицу заданий (jobs_add копирует строку)
+            free(name);
+            if(j){ j->procs[0].state = P_STOPPED; j->status = J_STOPPED; } // помечаем как остановленное
             return 128 + SIGTSTP; // статус как у сигнала остановки
         }
         if(WIFEXITED(status)) return(WEXITSTATUS(status)); // нормальный выход: возвращаем его код
@@ -291,24 +301,34 @@ static void run_stage(Node* n, char* cmdline){
     _exit(st); // завершаем этот процесс-этап с полученным статусом
 }
 //реализуем наш конвейер
+//Дерево конвейера строится с уклоном влево: a | b | c  ->  PIPE(PIPE(a, b), c).
+//Раньше левая часть запускалась как отдельный процесс-шелл, который сам запускал
+//вложенный конвейер: при 3+ командах в ps появлялся лишний процесс mybash, а команды
+//оказывались в разных группах процессов. Теперь дерево сначала "разворачивается" в
+//плоский массив этапов, и для каждого этапа создаётся ровно один процесс - как в bash.
 int run_pipeline(Node* node, bool flag_bg, char* cmdline, pid_t* out_pgid){ // flag_bg - запуск в фоне; out_pgid - вернуть группу вызывающему
     int count = 1; // число этапов = число символов | плюс 1
     for(Node* t = node; t && t->type == NODE_PIPE; t = t->left) count++; // идём вниз по левой ветке и считаем
+
     Node** stages = er_malloc((size_t)count * sizeof(Node*)); // этапы слева направо
     Node* t = node; // текущий узел при разворачивании
     for(int i = count - 1; i >= 1; i--){ // правые потомки - это этапы с конца
-        stages[i] = t->right; t = t->left;
+        stages[i] = t->right;
+        t = t->left;
     }
     stages[0] = t; // самый левый этап - не PIPE-узел
+
     int npipes = count - 1; // между этапами - по одному каналу
     int (*fds)[2] = er_malloc((size_t)npipes * sizeof(int[2])); // fds[i] - канал между этапом i и i+1
     for(int i = 0; i < npipes; i++){ // создаём все каналы заранее
         if(pipe(fds[i]) < 0){
             perror("pipe");
             for(int k = 0; k < i; k++){ close(fds[k][0]); close(fds[k][1]); } // закрываем уже созданные
-            free(fds); free(stages); return 1;
+            free(fds); free(stages);
+            return 1;
         }
     }
+
     pid_t* pids = er_malloc((size_t)count * sizeof(pid_t)); // pid каждого этапа
     pid_t pg = 0; // группа процессов конвейера = pid первого этапа
     int started = 0; // сколько этапов реально запущено
@@ -319,7 +339,7 @@ int run_pipeline(Node* node, bool flag_bg, char* cmdline, pid_t* out_pgid){ // f
             perror("fork");
             break; // уже запущенные этапы доработают сами, ниже закроем каналы и подождём их
         }
-        if(pid == 0){ //потомок: этап номер i
+        if(pid == 0){ // ---- потомок: этап номер i ----
             setpgid(0, i == 0 ? 0 : pg); // первый становится лидером новой группы, остальные входят в неё
             if(flag_bg) in_bg_job = true; // фон: больше не трогаем терминал (и все наши потомки тоже)
             if(!in_bg_job) tcsetpgrp(STDIN_FILENO, i == 0 ? getpid() : pg); // передний план: терминал группе конвейера
@@ -332,104 +352,46 @@ int run_pipeline(Node* node, bool flag_bg, char* cmdline, pid_t* out_pgid){ // f
         }
         if(i == 0) pg = pid; // группа конвейера - pid первого процесса
         setpgid(pid, pg); // родитель тоже ставит группу (защита от гонки)
-        pids[i] = pid; started++;
+        pids[i] = pid;
+        started++;
     }
+
     for(int k = 0; k < npipes; k++){ close(fds[k][0]); close(fds[k][1]); } // родителю каналы не нужны: иначе читатель не увидит EOF
     free(fds);
     free(stages);
     if(out_pgid) *out_pgid = pg; // сообщаем группу вызывающему
+
     int result = 0;
     if(started < count){ // не все этапы запущены (ошибка fork)
         for(int i = 0; i < started; i++) waitpid(pids[i], NULL, 0);
-        free(pids); return 1;
+        free(pids);
+        return 1;
     }
+
     if(flag_bg){ // фоновый конвейер: не ждём
-        jobs_add(pg, cmdline); // регистрируем задание
+        Job* newjob = jobs_add(pg, cmdline); // регистрируем задание
+        job_set_procs(newjob, pids, count); // и запоминаем pid каждого этапа конвейера
         printf("[%d] %d\n", jobs.vector[jobs.count -1].id, pg); // печатаем "[номер] pgid"
-        free(pids); return 0; 
+        free(pids);
+        return 0; // статус 0
     }
+
     for(int i = 0; i < count; i++){ // передний план: ждём все этапы
         int status = 0;
         if(waitpid(pids[i], &status, 0) < 0){
             perror("waitpid");
-            if(i == count - 1) result = 1; continue;
+            if(i == count - 1) result = 1;
+            continue;
         }
         if(i == count - 1){ // статус конвейера = статус последнего этапа
             if(WIFEXITED(status)) result = WEXITSTATUS(status);
             else if(WIFSIGNALED(status)) result = 128 + WTERMSIG(status);
         }
     }
-    free(pids); return result;
+    free(pids);
+    return result;
 }
-/*int run_pipeline(Node* node, bool flag_bg, char* cmdline, pid_t* out_pgid){ // flag_bg - запуск в фоне; out_pgid - вернуть группу вызывающему
-    int p[2]; // канал между левой и правой частью
-    pid_t left_pid, right_pid; // pid обоих потомков
-    if(pipe(p) < 0){ // создаём канал
-        perror("pipe");
-        return 1;
-    }
-    //для левой части дерева рекурсивно
-    fflush(NULL); // сброс буферов перед fork
-    left_pid = fork(); // потомок для левой части
-    if(left_pid < 0){ // fork не удался
-        perror("fork");
-        close(p[0]); // закрываем концы канала
-        close(p[1]);
-        return 1;
-    }
-    if(left_pid == 0){ //левый потомок !!!!! 
-        setpgid(0, 0); // он становится лидером новой группы процессов конвейера
-        if(flag_bg) in_bg_job = true; // фон: больше не трогаем терминал (и все наши потомки тоже)
-        if(!in_bg_job) tcsetpgrp(STDIN_FILENO, getpid()); // передний план: отдаём терминал группе конвейера
-        signal(SIGINT, SIG_DFL); // стандартные реакции на Ctrl+C / Ctrl+Z
-        signal(SIGTSTP, SIG_DFL);
-        dup2(p[1], STDOUT_FILENO); // stdout -> запись в канал
-        close(p[0]); close(p[1]); // оригиналы каналов закрываем, иначе читатель не получит EOF
-        run_stage(node->left, cmdline); // выполняем левый этап (не возвращается)
-    }
-    setpgid(left_pid, left_pid); // родитель тоже ставит группу (защита от гонки)
-    pid_t pg = left_pid; // группа конвейера = pid левого процесса
-    //для правой части дерева рекурсивно
-    fflush(NULL); // сброс буферов перед вторым fork
-    right_pid = fork(); // потомок для правой части
-    if(right_pid < 0){ // fork не удался
-        perror("fork");
-        close(p[0]);
-        close(p[1]);
-        return 1;
-    }
-    if(right_pid == 0){ // ---- правый потомок ----
-        setpgid(0, pg);  //говорим становится главным в группе процессов
-        if(flag_bg) in_bg_job = true; // фон - не трогаем терминал
-        if(!in_bg_job) tcsetpgrp(STDIN_FILENO, pg); // передний план: терминал группе pg
-        signal(SIGINT, SIG_DFL);
-        signal(SIGTSTP, SIG_DFL);
-        dup2(p[0], STDIN_FILENO); // stdin <- чтение из канала
-        close(p[0]); close(p[1]); // закрываем оригиналы
-        run_stage(node->right, cmdline); // выполняем правый этап
-    }
-    setpgid(right_pid, pg); // родитель добавляет правого в группу
-    close(p[0]); close(p[1]); // родителю канал не нужен: иначе читатель не увидит EOF
-    if(out_pgid) *out_pgid = pg; // сообщаем группу вызывающему
-    if(flag_bg){ // фоновый конвейер: не ждём
-        jobs_add(pg, cmdline); // регистрируем задание
-        printf("[%d] %d\n", jobs.vector[jobs.count -1].id, pg); // печатаем "[номер] pgid"
-        return 0; // статус 0
-    } else { // передний план: ждём оба процесса
-        int status1 = 0, status2 = 0;
-        if(waitpid(left_pid, &status1, 0) < 0){ // ждём левого
-            perror("waitpid");
-            return 1;
-        }
-        if(waitpid(right_pid, &status2, 0) < 0){ // ждём правого
-            perror("waitpid");
-            return 1;
-        }
-        if(WIFEXITED(status2)) return(WEXITSTATUS(status2)); // статус конвейера = статус правого этапа
-        if(WIFSIGNALED(status2)) return 128 + WTERMSIG(status2); // убит сигналом
-    }
-    return 0;
-}*/
+
 int run_minishell(Node* node, bool flag_bg, char* cmdline, pid_t* out_pgid){ // подшелл ( ... )
     fflush(NULL); // сброс буферов
     pid_t pid = fork(); // подшелл - отдельный процесс (изоляция cd, переменных)

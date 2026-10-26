@@ -1,198 +1,213 @@
-#include "common.h" 
-#include "builtins.h" 
-#include "jobs.h" 
-#include "memory.h"
-#include "utils.h" 
-#include "lexer.h" 
-#include "token.h" 
-#include <stdio.h> 
-#include <stdlib.h> 
-#include <string.h> 
-#include <unistd.h> 
-#include <errno.h> 
-#include <sys/wait.h> 
-int my_cd(char** argv){ 
-    char* old = gettingthiscwd(); // запоминаем каталог ДО смены - он станет $OLDPWD 
-    char* arg = argv[1]; 
+#include "common.h" // _POSIX_C_SOURCE 200809L должен быть определён ДО системных заголовков, иначе POSIX-функции могут быть недоступны
+#include "builtins.h" // наш заголовок: объявления my_cd, my_pwd, ..., is_mybuilt, run_mybuilt
+#include "jobs.h" // таблица заданий jobs, Job, resolve_job_spec, put_job_fg/bg, get_children, shell_interactive и т.д.
+#include "memory.h" // обёртки er_malloc/er_realloc/... (здесь подключено на всякий случай, напрямую в файле не используется)
+#include "utils.h" // gettingthiscwd() - получить текущий каталог в виде malloc-строки
+#include "lexer.h" // tilda_koren() - раскрытие "~" и "~user" в путь
+#include "token.h" // last_exit_status - код возврата последней команды ($?)
+#include <stdio.h> // printf, fprintf, fputs, fputc, puts, perror
+#include <stdlib.h> // getenv, setenv, unsetenv, exit, atoi, strtol, free
+#include <string.h> // strcmp, strchr, strerror
+#include <unistd.h> // chdir, getpgid
+#include <errno.h> // errno, EINTR, ECHILD
+#include <sys/wait.h> // waitpid, WIFEXITED, WEXITSTATUS, WIFSIGNALED, WTERMSIG, WIFSTOPPED
 
-    if(!arg || strcmp(arg, "~") == 0){ // ветка 1: "cd" или "cd ~" - идём в домашний каталог
-        char* home = getenv("HOME"); //путь дом каталога
-        if(!home) home = "/"; //если HOME не задан
-        if(chdir(home) != 0){ // пытаемся сменить каталог
-            perror("cd"); 
-            free(old); 
-            return 1; 
-        } 
-     } 
+int my_cd(char** argv){ // встроенная cd: argv[0]="cd", argv[1]=путь (или NULL); возвращает 0 при успехе, 1 при ошибке
+    char* old = gettingthiscwd(); // запоминаем каталог ДО смены - он станет $OLDPWD (строка из malloc, нужно free)
+    char* arg = argv[1]; // аргумент команды: куда переходить (может быть NULL, если написали просто "cd")
+
+    if(!arg || strcmp(arg, "~") == 0){ // ветка 1: "cd" без аргумента или "cd ~" - идём в домашний каталог
+        char* home = getenv("HOME"); // берём путь домашнего каталога из окружения
+        if(!home) home = "/"; // запасной вариант: если HOME не задан, идём в корень
+        if(chdir(home) != 0){ // пытаемся сменить каталог; не 0 = ошибка
+            perror("cd"); // печатаем "cd: <текст ошибки по errno>"
+            free(old); // освобождаем запомненный каталог перед выходом, чтобы не было утечки
+            return 1; // сообщаем об ошибке
+        } // конец проверки chdir для HOME
+     } // конец ветки 1
     else if(strcmp(arg, "-") == 0){ // ветка 2: "cd -" - вернуться в предыдущий каталог
-        char* previous = getenv("OLDPWD"); //путь до предыдущего каталога
+        char* previous = getenv("OLDPWD"); // предыдущий каталог хранится в переменной окружения OLDPWD
         if(!previous){ // если OLDPWD ещё ни разу не выставляли
-            fprintf(stderr, "Прошлый путь не был получен\n"); 
-            free(old); 
-            return 1; 
-        } 
+            fprintf(stderr, "Прошлый путь не был получен\n"); // сообщение об ошибке в stderr
+            free(old); // чистим память
+            return 1; // ошибка
+        } // конец проверки previous
         if(chdir(previous) != 0){ // пробуем перейти в предыдущий каталог
-            perror("cd"); 
-            free(old); 
-            return 1; 
-        } 
+            perror("cd"); // печатаем причину сбоя
+            free(old); // чистим память
+            return 1; // ошибка
+        } // конец проверки chdir для OLDPWD
     } else { // ветка 3: все остальные случаи - обычный путь или путь, начинающийся с "~"
         if(arg[0] == '~'){ // путь вида "~user/dir" или "~/dir" - нужно раскрыть тильду
-            char* path = tilda_koren(arg); 
+            char* path = tilda_koren(arg); // раскрываем тильду (результат - новая malloc-строка)
             if(chdir(path) != 0){ // пробуем перейти по раскрытому пути
-                perror("cd"); 
-                free(path); 
-                free(old); 
-                return 1; 
-            } 
-            free(path); 
+                perror("cd"); // печатаем причину сбоя
+                free(path); // освобождаем раскрытый путь
+                free(old); // освобождаем старый каталог
+                return 1; // ошибка
+            } // конец проверки chdir для раскрытого пути
+            free(path); // успех: раскрытый путь больше не нужен
         } else { // обычный путь без тильды
             if(chdir(arg) != 0){ // переходим прямо по тому, что передал пользователь
-                perror("cd"); 
-                free(old); 
-                return 1; 
-            } 
-        } 
-    } 
-    if(old) setenv("OLDPWD", old, 1); // успех: записываем прежний каталог в $OLDPWD 
+                perror("cd"); // печатаем причину сбоя
+                free(old); // освобождаем старый каталог
+                return 1; // ошибка
+            } // конец проверки chdir для обычного пути
+        } // конец вложенного if/else про тильду
+    } // конец цепочки if / else if / else
+    if(old) setenv("OLDPWD", old, 1); // успех: записываем прежний каталог в $OLDPWD (1 = перезаписать, если уже есть)
     char* cwd = gettingthiscwd(); // узнаём новый текущий каталог
     if(cwd){ // если получить его удалось
         setenv("PWD", cwd, 1); // обновляем переменную $PWD
-        free(cwd);
-    } 
-    free(old);
-    return 0; 
-} 
+        free(cwd); // освобождаем строку
+    } // конец if(cwd)
+    free(old); // освобождаем старый каталог (setenv скопировал строку, наша копия больше не нужна)
+    return 0; // успех
+} // конец my_cd
 int my_pwd(void){ // встроенная pwd: печатает текущий каталог
     char* cwd = gettingthiscwd(); // получаем каталог (malloc-строка)
     puts(cwd); // печатаем строку и перевод строки
-    free(cwd); 
-    return 0;
-} 
+    free(cwd); // освобождаем память
+    return 0; // успех
+} // конец my_pwd
 int my_export(char** argv){ // встроенная export: аргументы вида ИМЯ=значение
     for(int i = 1; argv[i] != NULL; i++){ // идём по аргументам, начиная с 1 (argv[0] = "export")
         char* equal = strchr(argv[i], '='); //возвращает адрес памяти - ищем первый '=' внутри той же строки
         if(!equal){ // знака '=' нет - аргумент записан неправильно
             fprintf(stderr, "Неправильный [export] прописан!\n"); // сообщение об ошибке
-            return 1;
-        }
-        *equal = '\0'; // временно режем строку на две
+            return 1; // выходим с ошибкой
+        } // конец проверки наличия '='
+        *equal = '\0'; // временно режем строку на две: "ИМЯ" и (за нулём) "значение"
         if(setenv(argv[i], equal + 1, 1) != 0){ //в окружении текущего процесса появится переменная (1 = перезаписать, если уже есть)
             perror("export"); // при ошибке печатаем причину
-            *equal = '='; // возвращаем '=' на место
-            return 1;
-        }
+            *equal = '='; // возвращаем '=' на место, чтобы не оставить строку испорченной
+            return 1; // выходим с ошибкой
+        } // конец проверки setenv
         *equal = '='; // восстанавливаем исходную строку после успешного setenv
-    }
-    return 0;
-}
-int my_unset(char** argv){ // удаляет переменные окружения по именам
+    } // конец цикла по аргументам
+    return 0; // всё прошло успешно
+} // конец my_export
+
+int my_unset(char** argv){ // встроенная unset: удаляет переменные окружения по именам
     for(int i = 1; argv[i] != NULL; i++){ // перебираем имена переменных
-        if(unsetenv(argv[i]) != 0){ // удаляем переменную
-            perror("unset"); 
-            return 1; 
-        } 
-    }
-    return 0;
-}
-int my_echo(char** argv){
-    int i = 1, newline = 1; // i - индекс первого печатаемого слова
+        if(unsetenv(argv[i]) != 0){ // удаляем переменную; не 0 = ошибка (например, недопустимое имя)
+            perror("unset"); // печатаем причину
+            return 1; // выходим с ошибкой, остальные аргументы не обрабатываем
+        } // конец проверки unsetenv
+    } // конец цикла
+    return 0; // успех
+} // конец my_unset
+int my_echo(char** argv){ // встроенная echo: печатает аргументы через пробел
+    int i = 1, newline = 1; // i - индекс первого печатаемого слова; newline - печатать ли '\n' в конце
     if(argv[1] && strcmp(argv[1], "-n") == 0){ // если первым аргументом идёт флаг -n
         newline = 0; i = 2; // не печатаем перевод строки и пропускаем сам флаг
-    }
+    } // конец обработки флага
     for(; argv[i]; i++){ // печатаем слова до конца массива (NULL)
         if(newline){ // режим без -n: слова начинаются с индекса 1
             if(i > 1){ // перед всеми словами, кроме первого
                 fputc(' ', stdout); // ставим пробел-разделитель
-            }
+            } // конец if(i > 1)
         } else { // режим с -n: слова начинаются с индекса 2
-            if(i > 2){ 
-                fputc(' ', stdout);
-            }
-        }
+            if(i > 2){ // перед всеми словами, кроме первого
+                fputc(' ', stdout); // ставим пробел-разделитель
+            } // конец if(i > 2)
+        } // конец выбора режима
         fputs(argv[i], stdout); // печатаем само слово без перевода строки
-    }
-    if(newline){ // если флага -n не было
-        fputc('\n', stdout);
-    }
-    return 0; 
-}
+    } // конец цикла печати
 
-int my_jobs(void){
+    if(newline){ // если флага -n не было
+        fputc('\n', stdout); // завершаем вывод переводом строки
+    } // конец if(newline)
+
+    return 0; // echo всегда успешен
+} // конец my_echo
+
+int my_jobs(void){ // встроенная jobs: показывает список заданий
     get_children(); // сначала обновляем статусы: собираем информацию о завершившихся/остановленных детях
     jobs_print(); // печатаем таблицу заданий (завершённые видны в последний раз как Done)
     jobs_remove(); // убираем из вектора завершённые задания, чтобы они не копились
-    return 0;
-}
+    return 0; // успех
+} // конец my_jobs
 
-int my_fg(char** argv){ //вернуть задание на передний план
+int my_fg(char** argv){ // встроенная fg: вернуть задание на передний план
     if(!shell_interactive){ // если шелл работает не с терминалом (-c, скрипт, pipe)
-        fprintf(stderr, "mysh: fg: управление заданиями отключено (неинтерактивный режим)\n"); //по ТЗ  
-        return 1;
-    }
-    get_children(); //чистим зомби
+        //по ТЗ: в неинтерактивном режиме управление заданиями отключено
+        fprintf(stderr, "mysh: fg: управление заданиями отключено (неинтерактивный режим)\n"); // сообщаем об этом
+        return 1; // ошибка
+    } // конец проверки режима
+    get_children(); //чистим зомби, сообщаем родителям(ю) - актуализируем статусы заданий
     Job* job = NULL; // сюда запишем выбранное задание
-    if(argv[1]){
+    if(argv[1]){ // пользователь указал, какое задание нужно
+        //поддержка %n, %+, %- (не только %n, как было раньше)
         job = resolve_job_spec(argv[1]); // превращаем спецификатор в указатель на задание (или NULL)
-        if(!job){
-            fprintf(stderr, "mysh: fg: %s: нет такого задания\n", argv[1]);
-            return 1;
-        }
-    } else {
-        if(jobs.count == 0){
-            fprintf(stderr, "У нас нет ни одного jobs\n");
-            return 1;
-        }
+        if(!job){ // задание не нашлось
+            fprintf(stderr, "mysh: fg: %s: нет такого задания\n", argv[1]); // сообщение об ошибке
+            return 1; // ошибка
+        } // конец проверки job
+    } else { // аргумента нет - берём текущее задание
+        if(jobs.count == 0){ // список заданий пуст
+            fprintf(stderr, "У нас нет ни одного jobs\n"); // сообщение об ошибке
+            return 1; // ошибка
+        } // конец проверки пустоты
 
         job = jobs_by_id(current_job_id); //по ТЗ: без аргумента - текущее задание ("+")
-        if(!job) job = &jobs.vector[jobs.count - 1];//если маркер не выставлен
-    }
+        if(!job) job = &jobs.vector[jobs.count - 1]; //подстраховка, если маркер не выставлен: берём последнее
+    } // конец выбора задания
 
-    if(job->status == J_DONE){
-        fprintf(stderr, "Задание уже завершено\n");
-        return 1;
-    }
+    if(job->status == J_DONE){ // задание уже завершилось
+        fprintf(stderr, "Задание уже завершено\n"); // сообщение об ошибке
+        return 1; // ошибка
+    } // конец проверки J_DONE
 
-    printf("%s\n", job->cmdline); // печатаем командную строку возвращаемого задания
+    printf("%s\n", job->cmdline); // как в bash: печатаем командную строку возвращаемого задания
 
     int to_fg = put_job_fg(job, 1); //продолжить выполнение если было остановлено (1 = послать SIGCONT)
-    return to_fg;
-}
+    return to_fg; // код возврата задания становится результатом fg
+} // конец my_fg
 
-int my_bg(char** argv){ //продолжить остановленное задание в фоне
+int my_bg(char** argv){ // встроенная bg: продолжить остановленное задание в фоне
     if(!shell_interactive){ // без терминала управление заданиями не работает
-        fprintf(stderr, "mysh: bg: управление заданиями отключено (неинтерактивный режим)\n");
-        return 1;
-    }
-    get_children(); //чистим зомби
+        //по ТЗ: в неинтерактивном режиме управление заданиями отключено
+        fprintf(stderr, "mysh: bg: управление заданиями отключено (неинтерактивный режим)\n"); // сообщаем об этом
+        return 1; // ошибка
+    } // конец проверки режима
+    get_children(); //чистим зомби, сообщаем родителям(ю) - актуализируем статусы
     Job* job = NULL; // выбранное задание
     if(argv[1]){ // указан спецификатор задания
+        //поддержка %n, %+, %- (не только %n, как было раньше)
         job = resolve_job_spec(argv[1]); // ищем задание по спецификатору
         if(!job){ // не нашли
             fprintf(stderr, "mysh: bg: %s: нет такого задания\n", argv[1]); // сообщение об ошибке
-            return 1;
-        }
+            return 1; // ошибка
+        } // конец проверки job
     } else { // без аргумента - текущее задание
         if(jobs.count == 0){ // заданий нет
-            fprintf(stderr, "У нас нет ни одного jobs\n");
-            return 1;
-        } 
+            fprintf(stderr, "У нас нет ни одного jobs\n"); // сообщение об ошибке
+            return 1; // ошибка
+        } // конец проверки пустоты
 
-        job = jobs_by_id(current_job_id); //без аргумента - текущее задание
-        if(!job) job = &jobs.vector[jobs.count - 1]; //если маркер не выставлен
-    } 
+        job = jobs_by_id(current_job_id); //по ТЗ: без аргумента - текущее задание
+        if(!job) job = &jobs.vector[jobs.count - 1]; //подстраховка, если маркер не выставлен
+    } // конец выбора задания
 
     if(job->status == J_RUNNING){ // задание и так работает
         printf("[%d] уже работает\n", job->id); // сообщаем номер задания
-        return 1;
-    } 
+        return 1; // считаем это ошибкой, как bash
+    } // конец проверки J_RUNNING
 
     job->status = J_RUNNING; // помечаем задание работающим ДО отправки сигнала
     printf("%s\n", job->cmdline); // печатаем команду продолжаемого задания
     put_job_bg(job, 1); // отправляем SIGCONT группе процессов, терминал не трогаем
-    return 0;
-} 
-int my_exit(char** argv){ //завершает работу интерпретатора
+
+    return 0; // успех
+} // конец my_bg
+
+//exit: завершает интерпретатор.
+//- без аргумента использует код возврата последней команды ($?/last_exit_status);
+//- с аргументом - переданное число, приведённое к диапазону 0..255;
+//- при наличии остановленных заданий первая попытка выхода только предупреждает
+//  и не завершает интерпретатор; повторный exit завершает его безусловно.
+int my_exit(char** argv){ // встроенная exit
     static bool exit_warned = false; //сохраняется между вызовами exit в течение сессии (живёт всю программу)
 
     get_children(); //подтягиваем актуальные статусы заданий перед проверкой
@@ -200,28 +215,31 @@ int my_exit(char** argv){ //завершает работу интерпрета
     for(int i = 0; i < jobs.count; i++){ // перебираем все задания
         if(jobs.vector[i].status == J_STOPPED){ // нашли остановленное
             has_stopped = true; // запоминаем
-            break;
-        }
-    }
+            break; // дальше искать незачем
+        } // конец проверки статуса
+    } // конец цикла
 
     if(has_stopped){ // есть остановленные задания
         if(!exit_warned){ // предупреждение ещё ни разу не показывали
-            fprintf(stderr, "mysh: есть остановленные задания (выполните exit ещё раз для выхода)\n");
+            fprintf(stderr, "mysh: есть остановленные задания (выполните exit ещё раз для выхода)\n"); // предупреждение
             exit_warned = true; // запоминаем, что предупреждение показано
-            return 1;
-        }
-    } else {
+            return 1; //не завершаем интерпретатор
+        } // конец if(!exit_warned)
+        //exit_warned уже true - пользователь подтвердил выход повторным exit
+    } else { // остановленных заданий нет
         exit_warned = false; //остановленных заданий больше нет - сбрасываем на будущее
-    }
+    } // конец if(has_stopped)
+
     int code; // код возврата процесса
     if(argv[1]){ // передан аргумент
         code = atoi(argv[1]); // превращаем строку в число (при мусоре получится 0)
-    } else {
+    } else { // аргумента нет
         code = last_exit_status; // берём $? последней команды
-    }
+    } // конец выбора кода
     code = ((code % 256) + 256) % 256; //приводим к диапазону 0..255 (в т.ч. для отрицательных чисел)
+
     exit(code); // завершаем процесс; exit сбрасывает буферы stdio и не возвращается
-}
+} // конец my_exit
 
 int my_help(void){ // встроенная help: печатает справку
     printf("Встроенные команды mysh:\n"); // заголовок
@@ -237,194 +255,222 @@ int my_help(void){ // встроенная help: печатает справку
     printf("  wait [pid|%%n]             - дождаться завершения задания(й)\n"); // %% печатает один символ %
     printf("  exit [код]                - завершить работу интерпретатора\n"); // строка про exit
     printf("  help                      - эта справка\n"); // строка про help
-    return 0;
-}
+    return 0; // успех
+} // конец my_help
+
+//таблица имён сигналов - без 'SIG' в начале, само числовое значение берём из
+//<signal.h> платформы (а не хардкодим), поэтому это переносимо между Linux/macOS,
+//где номера некоторых сигналов (SIGCHLD, SIGCONT и т.п.) физически различаются
 static const struct { const char* name; int sig; } signal_table[] = { // массив анонимных структур {имя, номер}
     {"HUP", SIGHUP}, {"INT", SIGINT}, {"QUIT", SIGQUIT}, {"ILL", SIGILL}, // первые сигналы
     {"TRAP", SIGTRAP}, {"ABRT", SIGABRT}, {"FPE", SIGFPE}, {"KILL", SIGKILL}, // следующие сигналы
     {"USR1", SIGUSR1}, {"SEGV", SIGSEGV}, {"USR2", SIGUSR2}, {"PIPE", SIGPIPE}, // пользовательские и др.
     {"ALRM", SIGALRM}, {"TERM", SIGTERM}, {"CHLD", SIGCHLD}, {"CONT", SIGCONT}, // таймер, завершение, потомок, продолжение
     {"STOP", SIGSTOP}, {"TSTP", SIGTSTP}, {"TTIN", SIGTTIN}, {"TTOU", SIGTTOU}, // сигналы остановки и терминала
-};
+}; // конец таблицы
 
 //разобрать имя/номер сигнала ("TERM", "SIGTERM", "9" и т.п.). -1, если не распознано
-static int parse_signal_name(const char* s){
+static int parse_signal_name(const char* s){ // static: функция видна только в этом файле
     if(!s || !*s) return -1; // NULL или пустая строка - не сигнал
     if(s[0] == 'S' && s[1] == 'I' && s[2] == 'G') s += 3; //допускаем и "SIGTERM", и просто "TERM" (пропускаем префикс)
     for(size_t i = 0; i < sizeof(signal_table)/sizeof(signal_table[0]); i++){ // перебираем все записи таблицы (размер массива / размер элемента)
         if(strcmp(signal_table[i].name, s) == 0) return signal_table[i].sig; // имя совпало - возвращаем номер
-    }
+    } // конец перебора таблицы
     char* end; // сюда strtol положит указатель на первый неразобранный символ
     long n = strtol(s, &end, 10); // пробуем разобрать строку как десятичное число
     if(*s != '\0' && *end == '\0') return (int)n; //это было просто число (строка непустая и разобрана целиком)
-    return -1;
-}
-int my_kill(char** argv){//посылает сигнал процессу или заданию
+    return -1; // ни имя, ни число
+} // конец parse_signal_name
+//kill [-s СИГНАЛ | -СИГНАЛ] цель ...
+//Сигнал по умолчанию - SIGTERM. Цель - pid (число) либо спецификатор задания (%n/%+/%-),
+//в этом случае сигнал уходит всей группе процессов задания.
+int my_kill(char** argv){ // встроенная kill
     int sig = SIGTERM; // сигнал по умолчанию
     int i = 1; // индекс текущего аргумента (0 - сама команда)
     if(argv[i] && strcmp(argv[i], "-s") == 0){ // форма "-s СИГНАЛ"
         if(!argv[i+1]){ // после -s ничего нет
-            fprintf(stderr, "mysh: kill: опция -s требует аргумент\n"); 
-            return 1; 
-        } 
+            fprintf(stderr, "mysh: kill: опция -s требует аргумент\n"); // сообщение об ошибке
+            return 1; // ошибка
+        } // конец проверки аргумента
         int parsed = parse_signal_name(argv[i+1]); // разбираем имя/номер сигнала
         if(parsed < 0){ // не распознан
-            fprintf(stderr, "mysh: kill: %s: неизвестный сигнал\n", argv[i+1]); 
-            return 1;
-        }
+            fprintf(stderr, "mysh: kill: %s: неизвестный сигнал\n", argv[i+1]); // сообщение об ошибке
+            return 1; // ошибка
+        } // конец проверки parsed
         sig = parsed; // запоминаем выбранный сигнал
         i += 2; // пропускаем "-s" и название сигнала
-    } else if(argv[i] && argv[i][0] == '-' && argv[i][1] != '\0'){ // форма "-СИГНАЛ" 
+    } else if(argv[i] && argv[i][0] == '-' && argv[i][1] != '\0'){ // форма "-СИГНАЛ" (одиночный "-" не считается)
         int parsed = parse_signal_name(argv[i] + 1); // разбираем строку без ведущего дефиса
         if(parsed < 0){ // не распознан
-            fprintf(stderr, "mysh: kill: %s: неизвестный сигнал\n", argv[i]); 
-            return 1;
-        }
+            fprintf(stderr, "mysh: kill: %s: неизвестный сигнал\n", argv[i]); // сообщение об ошибке
+            return 1; // ошибка
+        } // конец проверки parsed
         sig = parsed; // запоминаем выбранный сигнал
         i += 1; // пропускаем один аргумент
-    }
+    } // конец разбора опций
     if(!argv[i]){ // после опций нет ни одной цели
-        fprintf(stderr, "mysh: kill: не указана цель\n"); 
-        return 1;
-    } 
+        fprintf(stderr, "mysh: kill: не указана цель\n"); // сообщение об ошибке
+        return 1; // ошибка
+    } // конец проверки цели
     int status = 0; // общий код возврата: станет 1, если хоть одна цель не удалась
     for(; argv[i]; i++){ // обрабатываем каждую цель по очереди
         if(argv[i][0] == '%'){ // цель - задание (%n, %+, %-)
             Job* job = resolve_job_spec(argv[i]); // ищем задание
-            if(!job){
-                fprintf(stderr, "mysh: kill: %s: нет такого задания\n", argv[i]);
-                status = 1;
-                continue;
-            }
+            if(!job){ // не нашли
+                fprintf(stderr, "mysh: kill: %s: нет такого задания\n", argv[i]); // сообщение об ошибке
+                status = 1; // запоминаем неудачу
+                continue; // идём к следующей цели
+            } // конец проверки job
             if(kill(-(job->pgid), sig) < 0){ //отрицательный pgid - сигнал всей группе процессов
-                fprintf(stderr, "mysh: kill: %s: %s\n", argv[i], strerror(errno));
-                status = 1;
-            }
+                fprintf(stderr, "mysh: kill: %s: %s\n", argv[i], strerror(errno)); // печатаем причину
+                status = 1; // запоминаем неудачу
+            } else if((sig == SIGTERM || sig == SIGHUP) && job->status == J_STOPPED){
+                //как в bash: остановленный процесс не обработает SIGTERM/SIGHUP, пока его не разбудят - шлём ещё и SIGCONT
+                kill(-(job->pgid), SIGCONT);
+            } // конец проверки kill
         } else {char* end; // цель - числовой pid; end нужен для проверки strtol
             long pid = strtol(argv[i], &end, 10); // разбираем pid
             if(*argv[i] == '\0' || *end != '\0'){ // пустая строка или мусор после числа
-                fprintf(stderr, "mysh: kill: %s: неверный аргумент\n", argv[i]);
-                status = 1;
-                continue;
-            }
+                fprintf(stderr, "mysh: kill: %s: неверный аргумент\n", argv[i]); // сообщение об ошибке
+                status = 1; // запоминаем неудачу
+                continue; // идём к следующей цели
+            } // конец проверки pid
             if(kill((pid_t)pid, sig) < 0){ // посылаем сигнал одному процессу
-                fprintf(stderr, "mysh: kill: (%ld): %s\n", pid, strerror(errno));
-                status = 1;
-            }
-        }
-    }
-    return status;
-}
+                fprintf(stderr, "mysh: kill: (%ld): %s\n", pid, strerror(errno)); // печатаем причину
+                status = 1; // запоминаем неудачу
+            } // конец проверки kill
+        } // конец if/else по типу цели
+    } // конец цикла по целям
+    return status; // 0, если все цели обработаны успешно; иначе 1
+} // конец my_kill
 
 //wait [pid|%n] - без аргументов ждёт завершения ВСЕХ фоновых заданий (код 0);
 //с аргументом ждёт конкретное задание и возвращает его код возврата
 int my_wait(char** argv){ // встроенная wait
     if(!argv[1]){ // режим 1: аргументов нет
-        while(true){
+        //ждём, пока не останется ни одного задания в состоянии Running
+        while(true){ // цикл ожидания
             bool any_running = false; // остались ли работающие задания
             for(int i = 0; i < jobs.count; i++){ // перебираем задания
                 if(jobs.vector[i].status == J_RUNNING){ any_running = true; break; } // нашли работающее - дальше не ищем
-            }
+            } // конец перебора
             if(!any_running) break; // работающих нет - ждать больше нечего
-            int status; // сюда waitpid запишет статус завершения
-            pid_t pid = waitpid(-1, &status, 0); //блокирующе ждём любого потомка
-            if(pid < 0){ // waitpid вернул ошибку
-                if(errno == EINTR) continue; // прервал сигнал - повторяем ожидание
-                break;
+            //ждём ЦЕЛИКОМ группу каждого работающего задания (у конвейера процессов несколько)
+            for(int i = 0; i < jobs.count; i++){ // перебираем задания
+                if(jobs.vector[i].status != J_RUNNING) continue; // интересуют только работающие
+                int st; // статус очередного завершившегося процесса группы
+                while(true){ // собираем все процессы группы
+                    pid_t r = waitpid(-jobs.vector[i].pgid, &st, 0); // блокирующе ждём любого процесса этой группы
+                    if(r < 0){ // ошибка
+                        if(errno == EINTR) continue; // прервал сигнал - повторяем
+                        break; // ECHILD - в группе больше нет процессов
+                    }
+                }
+                jobs.vector[i].status = J_DONE; // группа целиком завершилась
             }
-            pid_t pgroup = getpgid(pid); // узнаём группу процесса, чтобы найти задание
-            if(pgroup == -1) pgroup = pid; // если не удалось (процесс уже собран) - считаем pid лидером группы
-            Job* job = jobs_by_pgid(pgroup); // ищем задание по группе
-            if(job){
-                if(WIFEXITED(status) || WIFSIGNALED(status)) job->status = J_DONE; // завершился сам или убит сигналом
-                else if(WIFSTOPPED(status)) job->status = J_STOPPED; // остановлен (без WUNTRACED сюда практически не попасть)
-            }
-        }
+        } // конец цикла ожидания
         jobs_remove(); // убираем завершённые задания из списка
-        return 0;
-    }
+        return 0; // wait без аргументов возвращает 0
+    } // конец режима 1
+    //ждём конкретное задание/pid. Упрощение: ожидание идёт по pid ведущего
+    //процесса задания (для одиночных фоновых команд этого достаточно;
+    //отдельные процессы конвейера в фоне всё равно подбираются общим
+    //обработчиком SIGCHLD/get_children).
     Job* job = NULL; // задание, соответствующее цели (может остаться NULL)
     pid_t target_pid; // pid, который будем ждать
     if(argv[1][0] == '%'){ // цель задана спецификатором задания
         job = resolve_job_spec(argv[1]); // ищем задание
-        if(!job){
-            fprintf(stderr, "mysh: wait: %s: нет такого задания\n", argv[1]);
-            return 1;
-        }
+        if(!job){ // не нашли
+            fprintf(stderr, "mysh: wait: %s: нет такого задания\n", argv[1]); // сообщение об ошибке
+            return 1; // ошибка
+        } // конец проверки job
         target_pid = job->pgid; // ждём лидера группы задания
     } else { // цель задана числом (pid)
         char* end; // для проверки strtol
         long pid = strtol(argv[1], &end, 10); // разбираем pid
         if(*argv[1] == '\0' || *end != '\0'){ // пустая строка или мусор
-            fprintf(stderr, "mysh: wait: %s: неверный аргумент\n", argv[1]);
-            return 1;
-        }
+            fprintf(stderr, "mysh: wait: %s: неверный аргумент\n", argv[1]); // сообщение об ошибке
+            return 1; // ошибка
+        } // конец проверки pid
         target_pid = (pid_t)pid; // приводим к типу pid_t
         job = jobs_by_pgid(target_pid); // пробуем найти связанное задание (если нет - останется NULL)
-    }
-    int status = 0;// сюда waitpid запишет статус завершения
-    while(true){ 
-        pid_t r = waitpid(target_pid, &status, 0); // блокирующе ждём именно этот pid
-        if(r < 0){
-            if(errno == EINTR) continue; // прервал сигнал - повторяем
-            if(errno == ECHILD) return 0; //уже завершилось раньше нас - трактуем как успех
-            fprintf(stderr, "mysh: wait: %s\n", strerror(errno)); // другая ошибка - печатаем причину
-            return 1;
+    } // конец выбора цели
+    int status = 0; // статус завершения ждомого процесса
+    if(job){ // у задания может быть несколько процессов (конвейер): ждём ВСЮ группу, а не только лидера
+        int last_status = 0; // статус последнего завершившегося процесса группы
+        while(true){ // собираем все процессы группы
+            pid_t r = waitpid(-job->pgid, &status, 0); // блокирующе ждём любого процесса этой группы
+            if(r < 0){ // ошибка
+                if(errno == EINTR) continue; // прервал сигнал - повторяем
+                break; // ECHILD - в группе больше нет процессов
+            }
+            last_status = status; // запоминаем статус завершившегося
         }
-        break;
+        status = last_status; // код задания - код последнего завершившегося процесса
+    } else { // просто pid, не являющийся заданием
+        while(true){ // цикл повтора при EINTR
+            pid_t r = waitpid(target_pid, &status, 0); // блокирующе ждём именно этот pid
+            if(r < 0){ // ошибка
+                if(errno == EINTR) continue; // прервал сигнал - повторяем
+                if(errno == ECHILD) return 0; //уже завершилось раньше нас - трактуем как успех
+                fprintf(stderr, "mysh: wait: %s\n", strerror(errno)); // другая ошибка - печатаем причину
+                return 1; // ошибка
+            } // конец обработки ошибки
+            break; // дождались - выходим из цикла
+        } // конец цикла
     }
     if(job) job->status = J_DONE; // помечаем найденное задание завершённым
     if(WIFEXITED(status)) return WEXITSTATUS(status); // нормальный выход - возвращаем его код
     if(WIFSIGNALED(status)) return 128 + WTERMSIG(status); // убит сигналом - 128 + номер сигнала (как в bash)
-    return 0;
-}
+    return 0; // иные случаи считаем успехом
+} // конец my_wait
 int is_mybuilt(Node* node){ // проверка: является ли команда встроенной (1 - да, 0 - нет)
     if(!node || node->type != NODE_CMD || node->argv == NULL || node->argv[0] == NULL) // защита: узла нет / не простая команда / нет argv / нет имени
-     return 0;
+     return 0; // такие узлы не встроенные
     char* name = node->argv[0]; // имя команды лежит в argv[0]
     if(strcmp(name, "cd") == 0) // это cd?
-    return 1; 
-    if(strcmp(name, "pwd") == 0)
-    return 1; 
-    if(strcmp(name, "export") == 0)
-     return 1; 
-    if(strcmp(name, "exit") == 0)
-     return 1; 
-    if(strcmp(name, "echo") == 0)
-     return 1; 
-    if(strcmp(name, "unset") == 0)
-     return 1; 
-    if(strcmp(name, "jobs") == 0)
-    return 1; 
-    if(strcmp(name, "fg") == 0) 
-     return 1; 
-    if(strcmp(name, "bg") == 0) 
-     return 1; 
-    if(strcmp(name, "help") == 0) 
-     return 1; 
-    if(strcmp(name, "kill") == 0) 
-    return 1; 
-    if(strcmp(name, "wait") == 0) 
-    return 1; 
-    return 0; 
-} 
+    return 1; // да
+    if(strcmp(name, "pwd") == 0) // это pwd?
+    return 1; // да
+    if(strcmp(name, "export") == 0) // это export?
+     return 1; // да
+    if(strcmp(name, "exit") == 0) // это exit?
+     return 1; // да
+    if(strcmp(name, "echo") == 0) // это echo?
+     return 1; // да
+    if(strcmp(name, "unset") == 0) // это unset?
+     return 1; // да
+    if(strcmp(name, "jobs") == 0) // это jobs?
+    return 1; // да
+    if(strcmp(name, "fg") == 0) // это fg?
+     return 1; // да
+    if(strcmp(name, "bg") == 0) // это bg?
+     return 1; // да
+    if(strcmp(name, "help") == 0) // это help?
+     return 1; // да
+    if(strcmp(name, "kill") == 0) // это kill?
+    return 1; // да
+    if(strcmp(name, "wait") == 0) // это wait?
+    return 1; // да
+    return 0; // не совпало ни с одним именем - внешняя команда
+} // конец is_mybuilt
 int run_mybuilt(Node* node){ // выполняет встроенную команду и возвращает её код возврата
-    if(!node || node->type != NODE_CMD || node->argv == NULL || node->argv[0] == NULL){
-        fprintf(stderr, "Пустая команда или ошибка парсинга\n"); 
-        return 1; 
-    } 
-    char* a = node->argv[0];//имя команды
+    if(!node || node->type != NODE_CMD || node->argv == NULL || node->argv[0] == NULL){ // та же защитная проверка
+        fprintf(stderr, "Пустая команда или ошибка парсинга\n"); // сообщение об ошибке
+        return 1; // ошибка
+    } // конец проверки узла
+    char* a = node->argv[0]; // имя команды
     if(strcmp(a, "cd") == 0) return my_cd(node->argv); // cd получает argv
     if(strcmp(a, "pwd") == 0) return my_pwd(); // pwd аргументов не принимает
-    if(strcmp(a, "export") == 0) return my_export(node->argv); 
-    if(strcmp(a, "unset") == 0) return my_unset(node->argv); 
-    if(strcmp(a, "jobs") == 0) return my_jobs();
-    if(strcmp(a, "bg") == 0) return my_bg(node->argv); 
-    if(strcmp(a, "fg") == 0) return my_fg(node->argv); 
-    if(strcmp(a, "echo") == 0) return my_echo(node->argv); 
-    if(strcmp(a, "exit") == 0) return my_exit(node->argv); 
-    if(strcmp(a, "help") == 0) return my_help(); 
-    if(strcmp(a, "kill") == 0) return my_kill(node->argv);
-    if(strcmp(a, "wait") == 0) return my_wait(node->argv); 
-    return 1; 
-} 
+    if(strcmp(a, "export") == 0) return my_export(node->argv); // export получает argv
+    if(strcmp(a, "unset") == 0) return my_unset(node->argv); // unset получает argv
+    if(strcmp(a, "jobs") == 0) return my_jobs(); // jobs аргументов не принимает
+    if(strcmp(a, "bg") == 0) return my_bg(node->argv); // bg получает argv
+    if(strcmp(a, "fg") == 0) return my_fg(node->argv); // fg получает argv
+    if(strcmp(a, "echo") == 0) return my_echo(node->argv); // echo получает argv
+    if(strcmp(a, "exit") == 0) return my_exit(node->argv); // exit получает argv
+    if(strcmp(a, "help") == 0) return my_help(); // help аргументов не принимает
+    if(strcmp(a, "kill") == 0) return my_kill(node->argv); // kill получает argv
+    if(strcmp(a, "wait") == 0) return my_wait(node->argv); // wait получает argv
+    return 1; //команда не builtin, поэтому придется создавать shell'у отдельный процесс внешние команды типа ls -> для работы (exec)
+} // конец run_mybuilt
