@@ -376,17 +376,58 @@ int run_pipeline(Node* node, bool flag_bg, char* cmdline, pid_t* out_pgid){ // f
         return 0; // статус 0
     }
 
-    for(int i = 0; i < count; i++){ // передний план: ждём все этапы
-        int status = 0;
-        if(waitpid(pids[i], &status, 0) < 0){
-            perror("waitpid");
-            if(i == count - 1) result = 1;
-            continue;
+    //Job control (Ctrl+Z на конвейере) работает только в самом шелле на терминале: не в фоне и не в подшелле
+    bool jc = shell_interactive && !in_bg_job && getpgrp() == shell_pgid;
+    if(!jc){ // без job control: ждём каждый этап по очереди
+        for(int i = 0; i < count; i++){ // передний план: ждём все этапы
+            int status = 0;
+            if(waitpid(pids[i], &status, 0) < 0){
+                perror("waitpid");
+                if(i == count - 1) result = 1;
+                continue;
+            }
+            if(i == count - 1){ // статус конвейера = статус последнего этапа
+                if(WIFEXITED(status)) result = WEXITSTATUS(status);
+                else if(WIFSIGNALED(status)) result = 128 + WTERMSIG(status);
+            }
         }
-        if(i == count - 1){ // статус конвейера = статус последнего этапа
-            if(WIFEXITED(status)) result = WEXITSTATUS(status);
-            else if(WIFSIGNALED(status)) result = 128 + WTERMSIG(status);
+    } else { // ждём события процессов всей группы: завершение ИЛИ остановку (WUNTRACED)
+        bool* done = er_malloc((size_t)count * sizeof(bool));
+        bool* stp  = er_malloc((size_t)count * sizeof(bool));
+        for(int i = 0; i < count; i++){ done[i] = false; stp[i] = false; }
+        int alive = count; // сколько этапов ещё не завершилось
+        bool stopped_all = false;
+        while(alive > 0){
+            int status = 0;
+            pid_t r = waitpid(-pg, &status, WUNTRACED);
+            if(r < 0){
+                if(errno == EINTR) continue; // прервали сигналом - повторяем
+                break; // ECHILD: процессов больше нет
+            }
+            int idx = -1;
+            for(int i = 0; i < count; i++) if(pids[i] == r){ idx = i; break; }
+            if(idx < 0) continue; // чужой процесс
+            if(WIFSTOPPED(status)){
+                stp[idx] = true;
+                int nstop = 0;
+                for(int i = 0; i < count; i++) if(!done[i] && stp[i]) nstop++;
+                if(nstop == alive){ stopped_all = true; break; } // все живые остановлены - возвращаем приглашение
+                continue; // остановились не все - ждём остальных
+            }
+            done[idx] = true; stp[idx] = false; alive--;
+            if(idx == count - 1){ // статус конвейера = статус последнего этапа
+                if(WIFEXITED(status)) result = WEXITSTATUS(status);
+                else if(WIFSIGNALED(status)) result = 128 + WTERMSIG(status);
+            }
         }
+        if(stopped_all){ // Ctrl+Z: превращаем конвейер в остановленное задание
+            Job* j = jobs_add(pg, cmdline);
+            job_set_procs(j, pids, count);
+            for(int i = 0; i < count; i++) j->procs[i].state = done[i] ? P_DONE : (stp[i] ? P_STOPPED : P_RUNNING);
+            j->status = J_STOPPED;
+            result = 128 + SIGTSTP;
+        }
+        free(done); free(stp);
     }
     free(pids);
     return result;
