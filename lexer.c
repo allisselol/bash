@@ -12,7 +12,6 @@
 bool cur_eof(Cursor* c){//является ли текущий символ концом строки
     return (c->position >= c->length);
 }
-//посмотреть текущий символ
 int cur_see(Cursor* c){
     if(cur_eof(c)){
         return EOF;
@@ -20,7 +19,6 @@ int cur_see(Cursor* c){
         return (unsigned char)c->s[c->position];
     }
 }
-//получить текущий символ
 int cur_get(Cursor* c){
     if(cur_eof(c)){
         return EOF;
@@ -44,9 +42,6 @@ bool match_symbol(Cursor* c, char* z){// проверяем, совпадает 
     }
     return false;// не совпало - курсор не трогаем
 }
-
-//словесный парсер кавычек мы типа прописали, теперь наша задача прописать чтение цифр
-//возвращает -1 если что-то не так
 int read_number(Cursor* c){
     int value = 0;// накапливаемое числовое значение
     size_t n = 0;// счётчик прочитанных цифр
@@ -125,8 +120,6 @@ char* read_command(char* command){//Функция для чтения $()/`....
     cutter(out); //как правило команды всегда заканчивают вывод переводом на следующую строку
     return out;
 }
-
-//функция для получения домашнего каталога(директории), полного пути к ней
 char* tilda_koren(char* string){
     if(!string || string[0] != '~') return er_strdup(string);// не тильда - возвращаем копию как есть
     char* slash = strchr(string, '/');// ищем первый '/' после тильды
@@ -160,15 +153,10 @@ char* tilda_koren(char* string){
     char* r = path_join(home, slash+1);
     return r;
 }
-
-//функция для чтения
-//'....' - делают все обычным текстом
-//"..." - делают все обычным текстом, кроме $VAR, $(...), `...` // \ - экранирование(\"$`)
 char* read_words(Cursor* c){
     size_t capacity = 64, count = 0;// растущий буфер под собираемое слово
     char* buffer = er_malloc(capacity);
     bool squote = false, dquote = false, start = true; //в начале слова
-
     while(!cur_eof(c)){
         int symbol = cur_see(c);// подсматриваем текущий символ, не съедая
         if(squote == false && dquote == false){// вне любых кавычек действуют разделители слова
@@ -181,7 +169,6 @@ char* read_words(Cursor* c){
             squote = !squote;// переключаем режим одиночных кавычек
             continue;
         }
-
         if(squote == false && symbol == '"'){// двойная кавычка (не внутри одиночных)
             dquote = !dquote;
             continue;
@@ -411,27 +398,22 @@ char* read_words(Cursor* c){
         free(buffer);
         return NULL;
     }
-    return buffer;// возвращаем собранное слово (оно уже терминировано '\0')
+    return buffer;
 }
-
-//наконец прописываем сам лексер
 void lexer(char* line, TokenVector* tv){
     Cursor cur = {line, 0, strlen(line)};// курсор над всей входной строкой
     while(!cur_eof(&cur)){
         skip_spaces(&cur);
         if(cur_eof(&cur)) break;
         if(cur_see(&cur) == '#') break;
-
         if(match_symbol(&cur, "&&")){   //если попадание match_symbol как и все другие функции сдвигает каретку(курсор)(указатель) нашей строки
             tv_push(tv, (Token){TOK_AND, NULL, -1, 0});
             continue;
         }
-
         if(match_symbol(&cur, "||")){
             tv_push(tv, (Token){TOK_OR, NULL, -1, 0});
             continue;
         }
-
         if(match_symbol(&cur, "<<<")){
             tv_push(tv, (Token){TOK_HERESTR, NULL, -1, 0});  //передает строку на stdin команды echo "smth" | cat - доп pipe
             continue;
@@ -505,9 +487,6 @@ void lexer(char* line, TokenVector* tv){
         int fd = read_number(&cur);//пробуем прочитать число (потенциальный номер fd)
         if(fd >= 0){
             size_t after_number = cur.position;//позиция сразу после цифр - для отката
-            //N>&M и N<&M: дублирование с ЯВНЫМ номером источника (2>&1, 1>&2, 3<&0).
-            //Номер M кладём в fd, номер N - в fd2 (раньше работала только форма >&M без N,
-            //а самая частая 2>&1 разбиралась как "2>", затем "&" (фон) и давала синтаксическую ошибку)
             if(match_symbol(&cur, ">&")){
                 int target = read_number(&cur);
                 if(target >= 0){
@@ -552,8 +531,8 @@ void lexer(char* line, TokenVector* tv){
             char bad = (char)cur_see(&cur);
             char msg[64];
             snprintf(msg, sizeof(msg), "недопустимый символ '%c'", bad);
-            report_syntax_error(msg);// сообщаем об ошибке синтаксиса, но продолжаем разбор строки дальше
-            break; //строка целиком отвергается как ошибочная - дальше не токенизируем
+            report_syntax_error(msg);
+            break;
         }
     }
     tv_push(tv, (Token){TOK_END, NULL, -1, 0});// добавляем токен конца потока, чтобы парсер знал, что токены закончились

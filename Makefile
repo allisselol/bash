@@ -5,10 +5,10 @@ CC = gcc
 # автоматически, что поддерживает конкретный компилятор.
 STD := $(shell echo "" | $(CC) -std=c23 -xc -E - >/dev/null 2>&1 && echo c23 || echo c2x)
 CFLAGS = -Wall -Wextra -std=$(STD)
-
+ 
 OBJDIR = obj
-
-SRCS = main.c memory.c utils.c token.c lexer.c node.c parser.c jobs.c builtins.c exec.c
+ 
+SRCS = main.c memory.c utils.c token.c lexer.c node.c parser.c jobs.c builtins.c exec.c readline.c
 OBJS = $(addprefix $(OBJDIR)/, $(SRCS:.c=.o))
 TARGET = mybash
 all: $(TARGET)
@@ -26,3 +26,4 @@ debug: clean $(TARGET)
 clean:
 	rm -rf $(OBJDIR) $(TARGET)
 .PHONY: all debug clean
+ 

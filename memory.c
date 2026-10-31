@@ -4,12 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 void die(void){//аварийное завершение программы при критической ошибке (например, нехватка памяти)
-fprintf(stderr, "критическая ошибка!!!\n");//сообщение в stderr, а не stdout — чтобы не мешалось с обычным выводом
+fprintf(stderr, "ошибка\n");//сообщение в stderr, а не stdout — чтобы не мешалось с обычным выводом
 exit(EXIT_FAILURE);//завершаем процесс с кодом ошибки (1), дальше код не выполняется
 }
 void* er_malloc(size_t n){//обёртка над malloc с проверкой результата
 void* p = malloc(n);//пытаемся выделить n байт
-if(!p) die();//если malloc вернул NULL — память кончилась, аварийно завершаемся
+if(!p)
+die();//если malloc вернул NULL — память кончилась, аварийно завершаемся
 return p;
 }
 void* er_calloc(size_t num, size_t n){ 

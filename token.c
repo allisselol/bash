@@ -1,8 +1,8 @@
-#include "common.h" // _POSIX_C_SOURCE 200809L должен быть определён ДО системных заголовков
+#include "common.h" 
 #include "token.h"  
 #include "memory.h" 
 #include <stdio.h>  
-// Добавляет токен t в конец динамического массива tv (растущий буфер токенов)
+
 void tv_push(TokenVector* tv, Token t){//функция добавления токена в список токенов
     if(tv->n == tv->capacity){  // массив заполнен до предела выделенной памяти
         if(tv->capacity){  // если уже было выделено хоть что-то

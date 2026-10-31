@@ -7,7 +7,6 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdbool.h>
-
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -18,10 +17,8 @@ char* cutter(char* s){//Обрезает завершающие \n и \r у ст
     }
     return s;
 }
-
-//получить текущую директорию //будет удобно в будущем для написания cd например
 char* gettingthiscwd(void){
-    size_t capacity = 256;//буфер
+    size_t capacity = 256;
     while(1){//растим буфер, пока не влезет
         char* buffer = er_malloc(capacity);// выделяем буфер нужного размера
         if(getcwd(buffer, capacity)){//пробуем прочитать cwd; успех - если вернулся не NULL
@@ -37,14 +34,12 @@ char* path_join(char* a, char* b){//соединить директории ил
     size_t len_a = strlen(a), len_b = strlen(b);//длины
     bool need_stick = (len_a > 0 && a[len_a - 1] != '/');//нужен ли разделитель / 
     char* r = er_malloc(len_a + need_stick + len_b + 1);//память выделяю пдд а + и тд
-    memcpy(r, a, len_a);// копируем a без завершающего нуля
+    memcpy(r, a, len_a);
     size_t stick = len_a;// текущая позиция записи в результате
     if(need_stick == 1) r[stick++] = '/';
     memcpy(r + stick, b, len_b + 1);// дописываем b вместе с его завершающим '\0'
     return r;
-}//получается склеенная мтрока
-
-//получение полного пути к исполняемому файлу
+}
 char* read_exe_path(void){
 #ifdef __APPLE__//на macOS нет /proc, поэтому использую системный API mach-o
     uint32_t size = 256;

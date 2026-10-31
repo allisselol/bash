@@ -17,3 +17,33 @@ kill %1                                  # завершить задание
 echo -n без_перевода_строки              # следующее приглашение начинается с новой строки
 exit 3                                   # затем в терминале: echo $?  -> 3
 cat << end #heredoc 
+
+sleep 111 | sleep 222 | sleep 333 | sleep 444 &
+ps -j
+
+sleep 100          (Ctrl+Z)
+jobs
+
+sleep 111 | sleep 222 | sleep 333 &
+kill -TSTP <pid sleep 222>
+jobs ; ps -j
+
+kill -s TSTP %1 ; jobs ; ps -j
+
+kill -CONT <pid sleep 222> ; jobs ; ps -j
+
+bg %1 ; jobs
+
+fg %1   (Ctrl+Z)   -> вернулось приглашение, jobs: Stopped
+fg %1   (Ctrl+C)   -> задание исчезло из jobs
+
+sleep 111 | sleep 222 | sleep 333     (Ctrl+Z)
+jobs ; ps -j
+
+sleep 3 | sleep 1 &
+wait %1                 -> ждёт ~3 секунды
+sleep 777 | sleep 778 &
+kill %1 ; jobs ; ps     -> задание и оба sleep исчезли
+sleep 100  (Ctrl+Z)
+kill %1 ; jobs          -> задание исчезло (SIGTERM + SIGCONT)
+
